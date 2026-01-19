@@ -1,0 +1,13 @@
+1、截取数据，去除前5000个采样点
+2、self.objective = objective（442行） 选择的生成目标（暂时不用修改）
+3、denoising_diffusion_pytorch_1d    910    
+                         with torch.no_grad():
+                            milestone = self.step // self.save_and_sample_every  #计算当前采样/保存的批次编号
+                            batches = num_to_groups(self.num_samples, self.batch_size) #将总样本数 num_samples 分成多个批次
+                            all_samples_list = list(map(lambda n: self.ema.ema_model.sample(batch_size=n), batches)) #生成样本
+
+                        all_samples = torch.cat(all_samples_list, dim = 0)
+
+                        torch.save(all_samples, str(self.results_folder / f'sample-{milestone}.png'))
+                        self.save(milestone)
+修改生成代码的图片格式，现在图片打不开
