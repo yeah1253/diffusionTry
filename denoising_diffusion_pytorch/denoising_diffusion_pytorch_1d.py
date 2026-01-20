@@ -5,7 +5,7 @@ from random import random
 from functools import partial
 from collections import namedtuple
 from multiprocessing import cpu_count
-
+import matplotlib.pyplot as plt
 import torch
 from torch import nn, einsum, Tensor
 from torch.nn import Module, ModuleList
@@ -916,7 +916,31 @@ class Trainer1D(object):
 
                         all_samples = torch.cat(all_samples_list, dim = 0)
 
-                        torch.save(all_samples, str(self.results_folder / f'sample-{milestone}.png'))
+                        try:
+                            # 转换到 CPU 并转为 numpy，形状通常是 (Batch, Channels, Length)
+                            samples_np = all_samples.detach().cpu().numpy()
+
+                            plt.figure(figsize=(12, 6))
+                            # 只画前 4 个样本，避免图太乱
+                            num_plots = min(4, samples_np.shape[0])
+
+                            for i in range(num_plots):
+                                # 假设是单通道，取第 0 个通道
+                                plt.subplot(num_plots, 1, i + 1)
+                                plt.plot(samples_np[i, 0, :], linewidth=1)
+                                plt.title(f'Sample {i} at step {self.step}')
+                                plt.grid(True, alpha=0.3)
+
+                            plt.tight_layout()
+                            # 保存为真正的 PNG 图片
+                            plt.savefig(str(self.results_folder / f'sample-{milestone}.png'))
+                            plt.close()  # 关闭画布释放内存
+
+                        except Exception as e:
+                            print(f"Error plotting samples: {e}")
+
+                            # --- 修改结束 ---
+
                         self.save(milestone)
 
                 pbar.update(1)

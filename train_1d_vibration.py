@@ -23,7 +23,7 @@ if __name__ == '__main__':
     if device.type == 'cuda':
         print(f"GPU Name: {torch.cuda.get_device_name(0)}")
 
-    mat_file_path = r'D:\PostGraduate\YearOne\HIL\data\simple_bearing\ball\9005k.mat'
+    mat_file_path = r'D:\haoran\数据集\simple_bearing\simple_bearing\ball\9005k.mat'
     print(f"Loading data from {mat_file_path}...")
     mat_data = loadmat(mat_file_path)
 
