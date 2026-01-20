@@ -36,6 +36,16 @@ if __name__ == '__main__':
     else:
         signal = bearing_acc_x.flatten()
 
+    #截取前5000个采样点
+    CUTOFF_POINTS = 5000
+    print(f"Original signal length: {len(signal)}")
+
+    if len(signal) > CUTOFF_POINTS:
+        signal = signal[CUTOFF_POINTS:]
+        print(f"Signal length after cropping start (steady state): {len(signal)}")
+    else:
+        raise ValueError(f"Error: Signal length ({len(signal)}) is shorter than cutoff points ({CUTOFF_POINTS})!")
+
     print(f"Signal shape: {signal.shape}")
     print(f"Signal length: {len(signal)}")
     print(f"Signal range: [{signal.min():.4f}, {signal.max():.4f}]")

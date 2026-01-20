@@ -14,8 +14,8 @@ REAL_DATA_PATH = r'D:\PostGraduate\YearOne\HIL\data\simple_bearing\ball\9005k.ma
 REAL_SIGNAL_NAME = 'Bearing_Acc_X'
 GENERATED_DIR = './generated_samples'
 FS = 5000  # Hz
-START_IDX = 1000
-END_IDX = 5000
+START_IDX = 6000 # 确保从稳态区域开始取样 (5000之后)
+END_IDX = 10000
 NUM_PEAKS = 10  # 提取的主要频率峰值数量
 FFT_SIZE_MULTIPLIER = 4  # FFT零填充倍数，增加频率分辨率（推荐4-16）
 
