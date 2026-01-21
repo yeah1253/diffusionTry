@@ -218,7 +218,7 @@ if __name__ == '__main__':
     generated_signals = []
     generated_indices = []
     
-    for i in range(10):
+    for i in range(9):
         file_path = os.path.join(GENERATED_DIR, f'generated_signal_{i}.npy')
         if os.path.exists(file_path):
             signal = np.load(file_path).astype(np.float64)
