@@ -2,7 +2,15 @@ import torch
 import numpy as np
 import os
 from scipy.io import loadmat
-from denoising_diffusion_pytorch import PhysiNet, GaussianDiffusion1D, Trainer1D, Dataset1D
+
+# 直接从一维扩散子模块中导入 PhysiNet / GaussianDiffusion1D 等，
+# 避免依赖外部已安装的 denoising_diffusion_pytorch 包版本中可能不存在 PhysiNet 的问题。
+from denoising_diffusion_pytorch.denoising_diffusion_pytorch_1d import (
+    PhysiNet,
+    GaussianDiffusion1D,
+    Trainer1D,
+    Dataset1D,
+)
 
 # 将长序列分割成多个样本
 def create_samples(signal, seq_length, overlap=0.5):
@@ -114,7 +122,7 @@ if __name__ == '__main__':
 
     # 训练完成后生成样本
     print("\nGenerating samples...")
-    sampled_seqs = diffusion.sample(batch_size = 10)
+    sampled_seqs = diffusion.sample(batch_size = 5)
     print(f"Generated samples shape: {sampled_seqs.shape}")
 
     # 反归一化生成的样本

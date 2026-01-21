@@ -429,11 +429,12 @@ class UFourierLayer(Module):
         b, c, n = x.shape
 
         # ① 使用时间 / 条件嵌入进行通道重标定，近似 Attention(Q,K,V) 中的调制
-        scale = self.time_to_scale(time_emb).view(b, c, 1)          # (B, C, 1)
-        x_mod = x * (1.0 + torch.tanh(scale))                       # 调制后的 x_t
+        # 为避免在 AMP 下产生 ComplexHalf（部分算子未实现），这里全部在 float32 / complex64 上完成 FFT 相关计算
+        scale = self.time_to_scale(time_emb.float()).view(b, c, 1)  # (B, C, 1), float32
+        x_mod = x.float() * (1.0 + torch.tanh(scale))               # 调制后的 x_t，float32
 
-        # ② FFT 到频域
-        x_fft = torch.fft.rfft(x_mod, dim=-1)                       # (B, C, N_fft)
+        # ② FFT 到频域（在 float32 上运行，得到 complex64）
+        x_fft = torch.fft.rfft(x_mod, dim=-1)                       # (B, C, N_fft), complex64
         amp = x_fft.abs()                                           # 幅值 |F(x)|
 
         # ③ 选取 Top-K 频率（式 (5)(6)），K 不超过频率长度
@@ -446,8 +447,10 @@ class UFourierLayer(Module):
         masked_fft.scatter_(-1, topk_idx, gathered)
 
         # ⑤ IFFT 回到时间域，得到物理驱动故障分量 P_{i,t}(x)（式 (7)）
-        p_it = torch.fft.irfft(masked_fft, n=n, dim=-1)             # (B, C, N)
-        return p_it
+        p_it = torch.fft.irfft(masked_fft, n=n, dim=-1)             # (B, C, N), float32
+
+        # 与输入实数张量保持同一 dtype（便于与 AMP / 其余网络兼容）
+        return p_it.to(x.dtype)
 
 
 class PhysiNet(Module):
