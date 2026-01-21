@@ -274,6 +274,9 @@ class Unet1D(Module):
         attn_dim_head = 32,
         attn_heads = 4
     ):
+        """
+        原始的一维 U-Net，用于无条件扩散建模。
+        """
         super().__init__()
 
         # determine dimensions
@@ -285,7 +288,7 @@ class Unet1D(Module):
         init_dim = default(init_dim, dim)
         self.init_conv = nn.Conv1d(input_channels, init_dim, 7, padding = 3)
 
-        # 下采样代码(encoder)部分
+        # 下采样(encoder)部分
         dims = [init_dim, *map(lambda m: dim * m, dim_mults)]
         in_out = list(zip(dims[:-1], dims[1:]))
 
@@ -310,12 +313,12 @@ class Unet1D(Module):
 
         resnet_block = partial(ResnetBlock, time_emb_dim = time_dim, dropout = dropout)
 
-        # layers
-        # 结构部分
+        # U-Net 结构
         self.downs = ModuleList([])
         self.ups = ModuleList([])
         num_resolutions = len(in_out)
-        # 下采样代码(encoder)部分
+
+        # 下采样(encoder)
         for ind, (dim_in, dim_out) in enumerate(in_out):
             is_last = ind >= (num_resolutions - 1)
 
@@ -325,12 +328,14 @@ class Unet1D(Module):
                 Residual(PreNorm(dim_in, LinearAttention(dim_in))),
                 Downsample(dim_in, dim_out) if not is_last else nn.Conv1d(dim_in, dim_out, 3, padding = 1)
             ]))
-        # 中间层代码部分（使用标准 Attention（非 LinearAttention）捕获全局依赖）
+
+        # 中间层（标准 Attention 捕获全局依赖）
         mid_dim = dims[-1]
         self.mid_block1 = resnet_block(mid_dim, mid_dim)
         self.mid_attn = Residual(PreNorm(mid_dim, Attention(mid_dim, dim_head = attn_dim_head, heads = attn_heads)))
         self.mid_block2 = resnet_block(mid_dim, mid_dim)
-        # 上采样代码(decoder)部分
+
+        # 上采样(decoder)
         for ind, (dim_in, dim_out) in enumerate(reversed(in_out)):
             is_last = ind == (len(in_out) - 1)
 
@@ -347,7 +352,10 @@ class Unet1D(Module):
         self.final_res_block = resnet_block(init_dim * 2, init_dim)
         self.final_conv = nn.Conv1d(init_dim, self.out_dim, 1)
 
-    def forward(self, x, time, x_self_cond = None): #去噪过程
+    def forward(self, x, time, x_self_cond = None):
+        """
+        标准无条件去噪过程。
+        """
         if self.self_condition:
             x_self_cond = default(x_self_cond, lambda: torch.zeros_like(x))
             x = torch.cat((x_self_cond, x), dim = 1)
@@ -387,6 +395,267 @@ class Unet1D(Module):
 
         x = self.final_res_block(x, t)
         return self.final_conv(x)
+
+
+class UFourierLayer(Module):
+    """
+    U-Fourier Layer（简化实现），对应论文中 Figure 4 上半部分的
+    物理驱动 Fourier 分解模块 [file:///c%3A/Users/User/Documents/GitHub/diffusion_try/diffusionTry/DiffPhysiNet.pdf]。
+
+    主要功能：
+    - 对输入特征在时间维做 FFT；
+    - 依据频域幅值选取 Top-K 物理显著频率（式 (5)(6)）；
+    - 仅保留这些频率分量并做 IFFT 得到物理驱动故障分量 P_{i,t}(x)（式 (7)）；
+    - 通过时间 / 条件嵌入产生的缩放向量，对输入进行调制，近似式 (4) 中基于 Timestep 和 WCE 的注意力。
+    """
+
+    def __init__(self, channels: int, time_dim: int, k_top: int = 8):
+        super().__init__()
+        self.channels = channels
+        self.k_top = k_top
+
+        # 利用时间嵌入（已经包含 WCE 信息）生成通道尺度因子，近似 Q,K,V 的调制效果
+        self.time_to_scale = nn.Linear(time_dim, channels)
+
+    def forward(self, x: Tensor, time_emb: Tensor) -> Tensor:
+        """
+        输入
+        - x: (B, C, L) 时间域特征 x_t 或其 lifted 表示；
+        - time_emb: (B, time_dim) 已融合 WCE 的时间步嵌入。
+
+        输出
+        - p_it: (B, C, L) 物理驱动故障分量 P_{i,t}(x)。
+        """
+        b, c, n = x.shape
+
+        # ① 使用时间 / 条件嵌入进行通道重标定，近似 Attention(Q,K,V) 中的调制
+        scale = self.time_to_scale(time_emb).view(b, c, 1)          # (B, C, 1)
+        x_mod = x * (1.0 + torch.tanh(scale))                       # 调制后的 x_t
+
+        # ② FFT 到频域
+        x_fft = torch.fft.rfft(x_mod, dim=-1)                       # (B, C, N_fft)
+        amp = x_fft.abs()                                           # 幅值 |F(x)|
+
+        # ③ 选取 Top-K 频率（式 (5)(6)），K 不超过频率长度
+        k = min(self.k_top, amp.shape[-1])
+        topk_vals, topk_idx = torch.topk(amp, k, dim=-1)            # (B, C, K)
+
+        # ④ 构造只保留 Top-K 频率分量的频谱
+        masked_fft = torch.zeros_like(x_fft)
+        gathered = x_fft.gather(-1, topk_idx)
+        masked_fft.scatter_(-1, topk_idx, gathered)
+
+        # ⑤ IFFT 回到时间域，得到物理驱动故障分量 P_{i,t}(x)（式 (7)）
+        p_it = torch.fft.irfft(masked_fft, n=n, dim=-1)             # (B, C, N)
+        return p_it
+
+
+class PhysiNet(Module):
+    """
+    基于 DiffPhysiNet 结构的一维 Physi-UNet（简化实现）。
+
+    结构对应论文 Figure 3 与 Figure 4：
+    - U-Fourier Layer：利用 Top-K 频率做物理驱动分解，得到 P_{i,t}(x)；
+    - U-Net：对残差 v0(x) - P_{i,t}(x) 建模，得到域特征 D_{i,t}(x)；
+    - 通过 reweight & 激活，将物理分量与域特征融合得到 C_{i,t}(x)，再做投影得到 x_{t-1}。
+    条件编码（WCE）通过时间嵌入注入，与 Eq. (4)(8)(9)(10) 的思想保持一致
+    [file:///c%3A/Users/User/Documents/GitHub/diffusion_try/diffusionTry/DiffPhysiNet.pdf]。
+    """
+
+    def __init__(
+        self,
+        dim,
+        init_dim = None,
+        out_dim = None,
+        dim_mults=(1, 2, 4, 8),
+        channels = 1,
+        cond_dim: int = 0,
+        dropout = 0.,
+        self_condition = False,
+        learned_variance = False,
+        learned_sinusoidal_cond = False,
+        random_fourier_features = False,
+        learned_sinusoidal_dim = 16,
+        sinusoidal_pos_emb_theta = 10000,
+        attn_dim_head = 32,
+        attn_heads = 4
+    ):
+        """
+        参数
+        - dim, init_dim, out_dim, dim_mults, dropout, self_condition, ...:
+          与 `Unet1D` 含义相同；
+        - channels: 原始振动信号的通道数（通常为 1）；
+        - cond_dim: 条件向量维度（例如工况/物理参数个数），0 表示退化为无条件 U-Net。
+        """
+        super().__init__()
+
+        self.base_channels = channels
+        self.cond_dim = cond_dim
+        self.self_condition = self_condition
+
+        # 这里保持与原始信号通道一致，条件信息不直接作为额外通道拼接
+        # 而是通过 WCE（Working Conditional Encoding）在“时间嵌入”空间中进行融合，
+        # 更贴近文中 “Physi-UNet 利用 WCE 进行噪声水平预测” 的描述 [file:///c%3A/Users/User/Documents/GitHub/diffusion_try/diffusionTry/DiffPhysiNet.pdf].
+        self.channels = channels
+
+        input_channels = channels * (2 if self_condition else 1)
+
+        init_dim = default(init_dim, dim)
+        self.init_conv = nn.Conv1d(input_channels, init_dim, 7, padding = 3)
+
+        # 下采样(encoder)
+        dims = [init_dim, *map(lambda m: dim * m, dim_mults)]
+        in_out = list(zip(dims[:-1], dims[1:]))
+
+        # time embeddings（与 Unet1D 完全一致）
+        time_dim = dim * 4
+
+        self.random_or_learned_sinusoidal_cond = learned_sinusoidal_cond or random_fourier_features
+
+        if self.random_or_learned_sinusoidal_cond:
+            sinu_pos_emb = RandomOrLearnedSinusoidalPosEmb(learned_sinusoidal_dim, random_fourier_features)
+            fourier_dim = learned_sinusoidal_dim + 1
+        else:
+            sinu_pos_emb = SinusoidalPosEmb(dim, theta = sinusoidal_pos_emb_theta)
+            fourier_dim = dim
+
+        self.time_mlp = nn.Sequential(
+            sinu_pos_emb,
+            nn.Linear(fourier_dim, time_dim),
+            nn.GELU(),
+            nn.Linear(time_dim, time_dim)
+        )
+
+        # 条件编码分支：将 WCE / 工况向量映射到与时间嵌入同一空间，
+        # 以便在噪声预测过程中对时间嵌入进行调制（physics-driven 条件约束）。
+        if self.cond_dim > 0:
+            self.cond_mlp = nn.Sequential(
+                nn.Linear(cond_dim, time_dim),
+                nn.GELU(),
+                nn.Linear(time_dim, time_dim)
+            )
+        else:
+            self.cond_mlp = None
+
+        resnet_block = partial(ResnetBlock, time_emb_dim = time_dim, dropout = dropout)
+
+        # U-Fourier Layer：在 lifted 特征空间上做物理分量抽取 P_{i,t}(x)
+        self.u_fourier = UFourierLayer(channels = init_dim, time_dim = time_dim, k_top = 8)
+
+        # U-Net 结构（建模域特征 D_{i,t}(x)）
+        self.downs = ModuleList([])
+        self.ups = ModuleList([])
+        num_resolutions = len(in_out)
+
+        for ind, (dim_in, dim_out) in enumerate(in_out):
+            is_last = ind >= (num_resolutions - 1)
+
+            self.downs.append(ModuleList([
+                resnet_block(dim_in, dim_in),
+                resnet_block(dim_in, dim_in),
+                Residual(PreNorm(dim_in, LinearAttention(dim_in))),
+                Downsample(dim_in, dim_out) if not is_last else nn.Conv1d(dim_in, dim_out, 3, padding = 1)
+            ]))
+
+        mid_dim = dims[-1]
+        self.mid_block1 = resnet_block(mid_dim, mid_dim)
+        self.mid_attn = Residual(PreNorm(mid_dim, Attention(mid_dim, dim_head = attn_dim_head, heads = attn_heads)))
+        self.mid_block2 = resnet_block(mid_dim, mid_dim)
+
+        for ind, (dim_in, dim_out) in enumerate(reversed(in_out)):
+            is_last = ind == (len(in_out) - 1)
+
+            self.ups.append(ModuleList([
+                resnet_block(dim_out + dim_in, dim_out),
+                resnet_block(dim_out + dim_in, dim_out),
+                Residual(PreNorm(dim_out, LinearAttention(dim_out))),
+                Upsample(dim_out, dim_in) if not is_last else  nn.Conv1d(dim_out, dim_in, 3, padding = 1)
+            ]))
+
+        # 输出维度与输入通道一致（或 2 倍用于 learned_variance）
+        default_out_dim = channels * (1 if not learned_variance else 2)
+        self.out_dim = default(out_dim, default_out_dim)
+
+        # 物理分量重加权 W(·)（式 (9) 中的 W），以及两层激活 σ1, σ2
+        self.reweight = nn.Conv1d(init_dim, init_dim, 1)
+        self.act_sigma1 = nn.SiLU()
+        self.act_sigma2 = nn.SiLU()
+
+        # 投影层 Q(·)，将高维特征映射回 1D 振动信号空间（式 (10)）
+        self.proj_Q = nn.Conv1d(init_dim, self.out_dim, 1)
+
+    def forward(self, x, time, cond: Tensor = None, x_self_cond = None):
+        """
+        条件去噪前向过程。
+
+        输入
+        - x: (B, C, L) 原始信号；
+        - time: (B,) 离散时间步；
+        - cond: (B, cond_dim) 或 (B, cond_dim, L) 条件张量 / WCE；
+        - x_self_cond: 自条件（与 `Unet1D` 一致，默认关闭）。
+        """
+        # 1) 时间嵌入
+        t = self.time_mlp(time)
+
+        # 2) 条件嵌入（WCE）：在时间嵌入空间中调制，而不是简单拼通道
+        if self.cond_dim > 0 and cond is not None and exists(self.cond_mlp):
+            # 兼容 (B, cond_dim) 或 (B, cond_dim, L) 的输入形状：
+            if cond.dim() == 3:
+                # 沿时间维做平均池化，得到全局工况向量 (B, cond_dim)
+                cond_vec = cond.mean(dim = -1)
+            elif cond.dim() == 2:
+                cond_vec = cond
+            else:
+                raise ValueError(f"cond must have shape (B, cond_dim) or (B, cond_dim, L), got {tuple(cond.shape)}")
+
+            cond_emb = self.cond_mlp(cond_vec)       # (B, time_dim)
+            t = t + cond_emb                         # WCE 约束噪声预测过程（Conditional Embedding）
+
+        if self.self_condition:
+            x_self_cond = default(x_self_cond, lambda: torch.zeros_like(x))
+            x = torch.cat((x_self_cond, x), dim = 1)
+
+        # 3) Lifting：将输入提升到高维特征空间 v0(x)
+        v0 = self.init_conv(x)                       # (B, C_lift, L)
+
+        # 4) U-Fourier Layer：得到物理驱动故障分量 P_{i,t}(x)
+        p_it = self.u_fourier(v0, t)                 # (B, C_lift, L)
+
+        # 5) U-Net：在残差 v0(x) - P_{i,t}(x) 上建模域特征 D_{i,t}(x)
+        x_u = v0 - p_it
+        h = []
+
+        for block1, block2, attn, downsample in self.downs:
+            x_u = block1(x_u, t)
+            h.append(x_u)
+
+            x_u = block2(x_u, t)
+            x_u = attn(x_u)
+            h.append(x_u)
+
+            x_u = downsample(x_u)
+
+        x_u = self.mid_block1(x_u, t)
+        x_u = self.mid_attn(x_u)
+        x_u = self.mid_block2(x_u, t)
+
+        for block1, block2, attn, upsample in self.ups:
+            x_u = torch.cat((x_u, h.pop()), dim = 1)
+            x_u = block1(x_u, t)
+
+            x_u = torch.cat((x_u, h.pop()), dim = 1)
+            x_u = block2(x_u, t)
+            x_u = attn(x_u)
+
+            x_u = upsample(x_u)
+
+        # 6) 物理分量重加权并与域特征融合（式 (9)）
+        p_weighted = self.act_sigma1(self.reweight(p_it))
+        c_it = self.act_sigma2(x_u + p_weighted)
+
+        # 7) 投影得到 x_{t-1}（式 (10)），与 DDPM-Backbone 接口兼容
+        x_out = self.proj_Q(c_it)
+        return x_out
 
 # gaussian diffusion trainer class
 

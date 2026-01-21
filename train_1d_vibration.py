@@ -2,7 +2,7 @@ import torch
 import numpy as np
 import os
 from scipy.io import loadmat
-from denoising_diffusion_pytorch import Unet1D, GaussianDiffusion1D, Trainer1D, Dataset1D
+from denoising_diffusion_pytorch import PhysiNet, GaussianDiffusion1D, Trainer1D, Dataset1D
 
 # 将长序列分割成多个样本
 def create_samples(signal, seq_length, overlap=0.5):
@@ -23,7 +23,7 @@ if __name__ == '__main__':
     if device.type == 'cuda':
         print(f"GPU Name: {torch.cuda.get_device_name(0)}")
 
-    mat_file_path = r'D:\haoran\数据集\simple_bearing\simple_bearing\ball\9005k.mat'
+    mat_file_path = r'D:\PostGraduate\YearOne\HIL\data\simple_bearing\ball\9005k.mat'
     print(f"Loading data from {mat_file_path}...")
     mat_data = loadmat(mat_file_path)
 
@@ -75,11 +75,15 @@ if __name__ == '__main__':
     # 创建数据集
     dataset = Dataset1D(samples_tensor)
 
-    # 创建模型
-    model = Unet1D(
+    # 创建条件扩散模型的骨干网络（Physi-UNet）
+    # 当前示例未显式使用条件（cond_dim=0），
+    # 后续可以根据 DiffPhysiNet.pdf 中的物理/健康状态设计，将 cond_dim 设置为对应维度，
+    # 并在训练与采样时通过 GaussianDiffusion1D 的 model_forward_kwargs 传入 cond。
+    model = PhysiNet(
         dim = 64,
         dim_mults = (1, 2, 4, 8),
-        channels = CHANNELS
+        channels = CHANNELS,
+        cond_dim = 0  # 0 表示当前退化为无条件模型，占好“条件生成”接口
     )
 
     # 创建扩散模型
