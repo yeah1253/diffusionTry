@@ -660,6 +660,7 @@ class PhysiNet(Module):
         x_out = self.proj_Q(c_it)
         return x_out
 
+# -----------------------------------------------------------------------------
 # gaussian diffusion trainer class
 
 def extract(a, t, x_shape):
@@ -684,6 +685,256 @@ def cosine_beta_schedule(timesteps, s = 0.008):
     alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
     betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
     return torch.clip(betas, 0, 0.999)
+
+# -----------------------------------------------------------------------------
+# UCFilter: Unsupervised Clustering Filter (simplified implementation)
+# -----------------------------------------------------------------------------
+
+def ucfilter_kl_scores(
+    samples: Tensor,
+    *,
+    sigma: float = 1.0,
+    embed_dim: int = 2,
+) -> Tensor:
+    """
+    计算每个样本对应的 KL 代价 C_d，用于 UCFilter 质量评估。
+
+    实现思想基于论文中的式 (11)(12) 与 KL(R||T) 定义：
+    - 在高维空间（原始信号）上，利用 Gaussian 核得到对称联合分布 R_ij；
+      r_ij = (r_i|j + r_j|i) / (2n)
+    - 在低维空间上，利用 Student-t 分布得到联合分布 T_ij；
+      t_ij ∝ (1 + ||y_i - y_j||^2)^(-1)
+    - C_d(i) = Σ_j r_ij (log r_ij - log t_ij)
+
+    参数
+    - samples: Tensor, 形状 (N, L) 或 (N, C, L)，生成的振动信号；
+    - sigma: 高维 Gaussian 核带宽；
+    - embed_dim: 低维嵌入维度（默认 2，对应 Figure 5 中的可视化）。
+
+    返回
+    - scores: Tensor, 形状 (N,), 每个样本的 KL 代价 C_d，越小表示与整体分布越一致。
+    """
+    assert samples.dim() in (2, 3), 'samples must be (N, L) or (N, C, L)'
+
+    if samples.dim() == 3:
+        n, c, l = samples.shape
+        x = samples.reshape(n, c * l)
+    else:
+        n, l = samples.shape
+        x = samples
+
+    device = x.device
+    x = x.float()
+
+    # 去中心化
+    x_centered = x - x.mean(dim = 0, keepdim = True)
+
+    # 低维嵌入：使用 PCA 近似 t-SNE 的低维空间（更高效且无需额外依赖）
+    # y: (N, embed_dim)
+    try:
+        # torch>=1.9 提供 pca_lowrank
+        u, s, v = torch.pca_lowrank(x_centered, q = embed_dim)
+        y = x_centered @ v[:, :embed_dim]
+    except Exception:
+        # 回退到简单的随机线性投影
+        proj = torch.randn(x_centered.size(1), embed_dim, device = device)
+        y = x_centered @ proj
+
+    eps = 1e-12
+
+    # ------------------------------
+    # 高维联合分布 R_ij
+    # ------------------------------
+    # pairwise squared distances in high-dim
+    d2_x = torch.cdist(x_centered, x_centered, p = 2) ** 2  # (N, N)
+
+    # 条件概率 r_j|i ∝ exp(-d2 / (2 sigma^2))
+    mask_offdiag = ~torch.eye(n, dtype = torch.bool, device = device)
+    p_cond = torch.exp(-d2_x / (2 * sigma ** 2))
+    p_cond = p_cond * mask_offdiag  # 对角为 0
+    p_cond = p_cond / (p_cond.sum(dim = 1, keepdim = True) + eps)
+
+    # 对称联合分布 R_ij = (r_i|j + r_j|i) / (2n)
+    R = (p_cond + p_cond.t()) / (2.0 * n)
+    R = R * mask_offdiag
+
+    # ------------------------------
+    # 低维联合分布 T_ij（Student-t）
+    # ------------------------------
+    d2_y = torch.cdist(y, y, p = 2) ** 2  # (N, N)
+
+    num = 1.0 / (1.0 + d2_y)             # (1 + ||y_i - y_j||^2)^(-1)
+    num = num * mask_offdiag
+
+    denom = num.sum()
+    T = num / (denom + eps)
+    T = T * mask_offdiag
+
+    # ------------------------------
+    # KL 代价：C_d(i) = Σ_j r_ij (log r_ij - log t_ij)
+    # ------------------------------
+    log_R = torch.log(R + eps)
+    log_T = torch.log(T + eps)
+    cd_matrix = R * (log_R - log_T)
+
+    scores = cd_matrix.sum(dim = 1)  # 每个样本一个分数
+    return scores
+
+
+def ucfilter_select_indices(
+    samples: Tensor,
+    *,
+    k_ratio: float = 0.9,
+    n_select: int | None = None,
+    sigma: float = 1.0,
+    embed_dim: int = 2,
+) -> tuple[Tensor, Tensor]:
+    """
+    UCFilter 选择高质量样本的索引。
+
+    参数
+    - samples: Tensor, 形状 (N, L) 或 (N, C, L)，生成信号；
+    - k_ratio: 选取样本占总数的比例 k = n / N，对应论文中的边界决策；
+    - n_select: 若指定，则精确选 n_select 个样本；否则按 k_ratio * N 取整；
+    - sigma, embed_dim: 传递给 ucfilter_kl_scores 的高维带宽与低维维度。
+
+    返回
+    - selected_indices: Tensor[int], 形状 (n_select,)，被 UCFilter 保留的样本索引；
+    - scores: Tensor[float], 形状 (N,)，所有样本的 KL 代价（越小越好）。
+    """
+    scores = ucfilter_kl_scores(samples, sigma = sigma, embed_dim = embed_dim)
+    n = scores.shape[0]
+
+    if n_select is None:
+        n_select = max(1, int(k_ratio * n))
+
+    # KL 越小越好，因此取 scores 升序的前 n_select 个
+    sorted_scores, sorted_idx = torch.sort(scores)  # 升序
+    selected_indices = sorted_idx[:n_select]
+
+    return selected_indices, scores
+
+
+def ucfilter_kmeans_select_indices(
+    samples: Tensor,
+    *,
+    num_clusters: int = 3,
+    k_ratio: float = 0.9,
+    sigma: float = 1.0,
+    embed_dim: int = 2,
+    max_iters: int = 50,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """
+    更贴近论文 Figure 5 的 UCFilter：
+    先在低维特征空间上进行 K-means 聚类，再在每个簇内按 KL 代价排序并按比例截取。
+
+    参数
+    - samples: (N, L) 或 (N, C, L)，生成信号；
+    - num_clusters: K-means 聚类的簇数；
+    - k_ratio: 在每个簇内保留的样本比例（例如 0.9 表示保留该簇中 KL 代价最小的 90% 样本）；
+    - sigma, embed_dim: 与 ucfilter_kl_scores 一致；
+    - max_iters: K-means 迭代次数上限。
+
+    返回
+    - selected_indices: (M,), M 为最终保留的样本数（各簇拼接）；
+    - scores: (N,), 每个样本的 KL 代价；
+    - labels: (N,), 每个样本的簇标签。
+    """
+    assert samples.dim() in (2, 3), 'samples must be (N, L) or (N, C, L)'
+
+    if samples.dim() == 3:
+        n, c, l = samples.shape
+        x = samples.reshape(n, c * l)
+    else:
+        n, l = samples.shape
+        x = samples
+
+    device = x.device
+    x = x.float()
+    x_centered = x - x.mean(dim = 0, keepdim = True)
+
+    # 低维特征 y（用于 K-means 聚类）
+    try:
+        _, _, v = torch.pca_lowrank(x_centered, q = embed_dim)
+        y = x_centered @ v[:, :embed_dim]
+    except Exception:
+        proj = torch.randn(x_centered.size(1), embed_dim, device = device)
+        y = x_centered @ proj
+
+    # KL 代价（与全局 UCFilter 一致）
+    scores = ucfilter_kl_scores(samples, sigma = sigma, embed_dim = embed_dim)
+
+    # ------------------------------
+    # 在 y 上执行 K-means 聚类
+    # ------------------------------
+    y_for_cluster = y
+    try:
+        out = torch.kmeans(
+            y_for_cluster,
+            num_clusters,
+            dist = 'euclidean',
+            niter = max_iters,
+            device = device,
+        )
+        labels = out.labels
+    except Exception:
+        # 手写简单 K-means（Lloyd 算法）
+        idx = torch.randperm(n, device = device)[:num_clusters]
+        centers = y_for_cluster[idx]  # (K, D)
+
+        for _ in range(max_iters):
+            dists = torch.cdist(y_for_cluster, centers, p = 2)  # (N, K)
+            labels = dists.argmin(dim = 1)                      # (N,)
+
+            new_centers = []
+            for c_idx in range(num_clusters):
+                mask = labels == c_idx
+                if mask.any():
+                    new_centers.append(y_for_cluster[mask].mean(dim = 0))
+                else:
+                    # 若某个簇为空，则保持原中心
+                    new_centers.append(centers[c_idx])
+            new_centers = torch.stack(new_centers, dim = 0)
+
+            if torch.allclose(new_centers, centers):
+                break
+            centers = new_centers
+
+    # ------------------------------
+    # 在每个簇内按 KL 代价排序并截取前 k_ratio 部分
+    # ------------------------------
+    selected_indices_list = []
+
+    for c_idx in range(num_clusters):
+        mask = labels == c_idx
+        cluster_indices = torch.nonzero(mask, as_tuple = False).flatten()
+        if cluster_indices.numel() == 0:
+            continue
+
+        n_c = cluster_indices.numel()
+        n_keep_c = max(1, int(k_ratio * n_c))
+
+        cluster_scores = scores[cluster_indices]
+        _, sorted_local_idx = torch.sort(cluster_scores)  # 升序
+        keep_local_idx = sorted_local_idx[:n_keep_c]
+        keep_global_idx = cluster_indices[keep_local_idx]
+
+        selected_indices_list.append(keep_global_idx)
+
+    if len(selected_indices_list) == 0:
+        # 极端情况：如果没有选中任何样本，则退回全局 KL 选择策略
+        selected_indices, scores_global = ucfilter_select_indices(
+            samples,
+            k_ratio = k_ratio,
+            sigma = sigma,
+            embed_dim = embed_dim,
+        )
+        dummy_labels = torch.zeros(scores_global.shape[0], dtype = torch.long, device = device)
+        return selected_indices, scores_global, dummy_labels
+
+    selected_indices = torch.cat(selected_indices_list, dim = 0)
+
+    return selected_indices, scores, labels
 
 class GaussianDiffusion1D(Module):
     def __init__(

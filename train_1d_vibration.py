@@ -10,6 +10,7 @@ from denoising_diffusion_pytorch.denoising_diffusion_pytorch_1d import (
     GaussianDiffusion1D,
     Trainer1D,
     Dataset1D,
+    ucfilter_kmeans_select_indices,
 )
 
 # 将长序列分割成多个样本
@@ -122,17 +123,33 @@ if __name__ == '__main__':
 
     # 训练完成后生成样本
     print("\nGenerating samples...")
-    sampled_seqs = diffusion.sample(batch_size = 5)
-    print(f"Generated samples shape: {sampled_seqs.shape}")
+    sampled_seqs = diffusion.sample(batch_size = 64)  # 先生成一定数量的样本
+    print(f"Generated samples shape: {sampled_seqs.shape}")  # (N, 1, L)
 
-    # 反归一化生成的样本
-    sampled_seqs_np = sampled_seqs.squeeze(1).cpu().numpy()  # 移除通道维度
+    # 使用 UCFilter 选择高质量样本（基于 KL 代价）
+    print("Applying UCFilter to select high-quality generated samples...")
+    with torch.no_grad():
+        # UCFilter 期望输入 (N, C, L) 的 tensor
+        selected_idx, kl_scores, cluster_labels = ucfilter_kmeans_select_indices(
+            sampled_seqs.detach().cpu(),
+            num_clusters = 3,  # 可根据数据分布调整聚类簇数
+            k_ratio = 0.9,     # 在每个簇内保留 KL 代价较小的前 90% 样本
+            sigma = 1.0,
+            embed_dim = 2,
+        )
+
+    selected_idx_np = selected_idx.numpy()
+    print(f"Total generated: {sampled_seqs.shape[0]}, selected by UCFilter: {len(selected_idx_np)}")
+
+    # 仅对通过 UCFilter 的样本做反归一化与保存
+    sampled_seqs_np = sampled_seqs.squeeze(1).cpu().numpy()   # (N, L)
     sampled_seqs_denorm = sampled_seqs_np * (signal_max - signal_min) + signal_min
+    sampled_filtered = sampled_seqs_denorm[selected_idx_np]
 
-    # 保存生成的样本
+    # 保存生成且通过 UCFilter 筛选的样本
     os.makedirs('./generated_samples', exist_ok=True)
-    for i, gen_signal in enumerate(sampled_seqs_denorm):
+    for i, (idx, gen_signal) in enumerate(zip(selected_idx_np, sampled_filtered)):
         np.save(f'./generated_samples/generated_signal_{i}.npy', gen_signal)
-        print(f"Saved generated signal {i} to ./generated_samples/generated_signal_{i}.npy")
+        print(f"Saved UCFilter-selected generated signal {i} (orig idx={idx}) to ./generated_samples/generated_signal_{i}.npy")
 
     print("\nTraining completed!")
