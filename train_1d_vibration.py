@@ -1,7 +1,7 @@
 import torch
 import numpy as np
 import os
-from scipy.io import loadmat
+# from scipy.io import loadmat  # no longer needed for synthetic dataset
 
 # 直接从一维扩散子模块中导入 PhysiNet / GaussianDiffusion1D 等，
 # 避免依赖外部已安装的 denoising_diffusion_pytorch 包版本中可能不存在 PhysiNet 的问题。
@@ -13,91 +13,114 @@ from denoising_diffusion_pytorch.denoising_diffusion_pytorch_1d import (
     ucfilter_kmeans_select_indices,
 )
 
-# 将长序列分割成多个样本
+import matplotlib.pyplot as plt
+
+# Synthetic SDUST-like dataset implementation
+class SyntheticSDUSTDataset(torch.utils.data.Dataset):
+    """
+    Synthetic dataset mimicking SDUST bearing signals controlled by RPM and Load.
+
+    - RPM range: 1000 .. 3000 (continuous random)
+    - Load range: 0 .. 60 (continuous random)
+    - fs: 25600 Hz
+    - seq_length: 1024
+    Returns (signal, cond) where
+      - signal: Tensor (1, L) float32 normalized to [-1, 1]
+      - cond:   Tensor (2,) normalized [norm_rpm, norm_load]
+    """
+    def __init__(self, n_samples=2048, seq_length=1024, fs=25600.0, seed=None):
+        super().__init__()
+        self.n_samples = int(n_samples)
+        self.seq_length = int(seq_length)
+        self.fs = float(fs)
+        self.t = np.arange(self.seq_length) / float(self.fs)
+
+        self.rng = np.random.default_rng(seed)
+
+        # sample parameters
+        self.rpms = self.rng.uniform(1000.0, 3000.0, size=self.n_samples).astype(np.float32)
+        self.loads = self.rng.uniform(0.0, 60.0, size=self.n_samples).astype(np.float32)
+
+        signals = []
+        conds = []
+        for rpm, load in zip(self.rpms, self.loads):
+            sig = self._synthesize_once(rpm, load)
+            signals.append(sig.astype(np.float32))
+            conds.append(self._normalize_cond(rpm, load).astype(np.float32))
+
+        self.signals = np.stack(signals, axis=0)  # (N, L)
+        self.conds = np.stack(conds, axis=0)      # (N, 2)
+
+    def __len__(self):
+        return self.n_samples
+
+    def __getitem__(self, idx):
+        sig = torch.from_numpy(self.signals[idx]).unsqueeze(0)  # (1, L)
+        cond = torch.from_numpy(self.conds[idx])                # (2,)
+        return sig, cond
+
+    def _normalize_cond(self, rpm, load):
+        norm_rpm = (rpm - 1000.0) / 2000.0
+        norm_load = load / 60.0
+        return np.array([norm_rpm, norm_load], dtype=np.float32)
+
+    def _synthesize_once(self, rpm, load):
+        # f_fault locked to RPM, outer-race-like approx
+        f_fault = (rpm / 60.0) * 3.5
+        A = 0.5 + 0.5 * (load / 60.0)
+        signal = A * np.sin(2.0 * np.pi * f_fault * self.t)
+
+        sigma = 0.06 * A
+        noise = self.rng.normal(0.0, sigma, size=self.t.shape)
+        signal = signal + noise
+
+        # small second harmonic to resemble more realistic spectrum
+        signal += 0.05 * (load / 60.0) * np.sin(2.0 * np.pi * 2.0 * f_fault * self.t)
+
+        max_abs = np.max(np.abs(signal)) + 1e-8
+        signal = signal / max_abs
+        signal = np.clip(signal, -1.0, 1.0)
+        return signal
+
+
+# 将长序列分割成多个样本（保留给参考，但现在使用合成数据）
 def create_samples(signal, seq_length, overlap=0.5):
-    """将长序列分割成多个样本"""
     step = int(seq_length * (1 - overlap))
     samples = []
-    
     for i in range(0, len(signal) - seq_length + 1, step):
         sample = signal[i:i + seq_length]
         samples.append(sample)
-    
     return np.array(samples)
 
+
 if __name__ == '__main__':
-    # 加载 .mat 文件
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     if device.type == 'cuda':
         print(f"GPU Name: {torch.cuda.get_device_name(0)}")
 
-    mat_file_path = r'D:\haoran\数据集\simple_bearing\simple_bearing\ball\9005k.mat'
-    print(f"Loading data from {mat_file_path}...")
-    mat_data = loadmat(mat_file_path)
+    # ---------- dataset configuration (synthetic SDUST) ----------
+    SEQ_LENGTH = 1024
+    FS = 25600.0
+    N_SAMPLES = 2048
 
-    # 提取 Bearing_Acc_X 信号
-    bearing_acc_x = mat_data['Bearing_Acc_X']  # 应该是 1x50001 的数组
+    print("Creating synthetic SDUST-like dataset...")
+    dataset = SyntheticSDUSTDataset(n_samples=N_SAMPLES, seq_length=SEQ_LENGTH, fs=FS, seed=42)
+    print(f"Dataset size: {len(dataset)}, seq_length={SEQ_LENGTH}, fs={FS}")
 
-    # 转换为 numpy 数组并展平
-    if bearing_acc_x.shape[0] == 1:
-        signal = bearing_acc_x[0]  # 如果是 1xN，取第一行
-    else:
-        signal = bearing_acc_x.flatten()
+    # ---------- model and diffusion (enable cond_dim=2) ----------
+    CHANNELS = 1
+    COND_DIM = 2
 
-    #截取前5000个采样点
-    CUTOFF_POINTS = 5000
-    print(f"Original signal length: {len(signal)}")
-
-    if len(signal) > CUTOFF_POINTS:
-        signal = signal[CUTOFF_POINTS:]
-        print(f"Signal length after cropping start (steady state): {len(signal)}")
-    else:
-        raise ValueError(f"Error: Signal length ({len(signal)}) is shorter than cutoff points ({CUTOFF_POINTS})!")
-
-    print(f"Signal shape: {signal.shape}")
-    print(f"Signal length: {len(signal)}")
-    print(f"Signal range: [{signal.min():.4f}, {signal.max():.4f}]")
-
-    # 参数设置
-    SEQ_LENGTH = 1024  # 序列长度，可以根据需要调整 (128, 256, 512, 1024 等)
-    CHANNELS = 1  # 单通道信号
-    OVERLAP = 0.8  # 重叠比例，用于生成更多训练样本
-
-    # 创建样本
-    samples = create_samples(signal, SEQ_LENGTH, OVERLAP)
-    print(f"Created {len(samples)} samples of length {SEQ_LENGTH}")
-
-    # 归一化数据到 [-1, 1] 范围（之前是 [0,1]）
-    signal_min = samples.min()
-    signal_max = samples.max()
-    # avoid division by zero
-    denom = (signal_max - signal_min) + 1e-8
-    samples_normalized = 2.0 * (samples - signal_min) / denom - 1.0
-
-    print(f"Normalized range: [{samples_normalized.min():.4f}, {samples_normalized.max():.4f}]")
-
-    # 转换为 torch tensor，格式: (batch, channels, seq_length)
-    samples_tensor = torch.from_numpy(samples_normalized).float()
-    samples_tensor = samples_tensor.unsqueeze(1)  # 添加通道维度: (batch, 1, seq_length)
-
-    print(f"Training data shape: {samples_tensor.shape}")
-
-    # 创建数据集
-    dataset = Dataset1D(samples_tensor)
-
-    # 创建条件扩散模型的骨干网络（Physi-UNet）
-    # 当前示例未显式使用条件（cond_dim=0），
-    # 后续可以根据 DiffPhysiNet.pdf 中的物理/健康状态设计，将 cond_dim 设置为对应维度，
-    # 并在训练与采样时通过 GaussianDiffusion1D 的 model_forward_kwargs 传入 cond。
+    print("Building PhysiNet (cond_dim=2)...")
     model = PhysiNet(
         dim = 64,
         dim_mults = (1, 2, 4, 8),
         channels = CHANNELS,
-        cond_dim = 0  # 0 表示当前退化为无条件模型，占好“条件生成”接口
+        cond_dim = COND_DIM,
+        dropout = 0.0,
     )
 
-    # 创建扩散模型
     diffusion = GaussianDiffusion1D(
         model,
         seq_length = SEQ_LENGTH,
@@ -106,68 +129,121 @@ if __name__ == '__main__':
         auto_normalize = False,
     )
 
-    # 创建训练器
+    # ---------- trainer (small default steps for quick verification) ----------
     trainer = Trainer1D(
         diffusion,
         dataset = dataset,
-        train_batch_size = 16,
+        train_batch_size = 32,
         train_lr = 8e-5,
-        train_num_steps = 10000,  # 训练步数，可以根据需要调整
-        gradient_accumulate_every = 2,
+        train_num_steps = 10000,        # demo default; increase for full training
+        gradient_accumulate_every = 1,
         ema_decay = 0.995,
-        amp = True,  # 混合精度训练
-        save_and_sample_every = 1000,  # 每1000步保存一次
+        amp = False,                  # disable AMP for small demo stability
+        save_and_sample_every = 1000,
+        num_samples = 16,
         results_folder = './results_vibration',
-        denorm_min = float(signal_min),
-        denorm_max = float(signal_max),
     )
 
-    # 开始训练
-    print("Starting training...")
+    print("Starting training on synthetic dataset...")
     trainer.train()
+    print("Training finished.")
 
-    # 训练完成后生成样本
-    print("\nGenerating samples...")
-    sampled_seqs = diffusion.sample(batch_size = 64)  # 先生成一定数量的样本
-    print(f"Generated samples shape: {sampled_seqs.shape}")  # (N, 1, L)
+    # ---------- physical-consistency check: sample conditioned on two RPMs ----------
+    def norm_cond(rpm, load):
+        return np.array([(rpm - 1000.0) / 2000.0, load / 60.0], dtype=np.float32)
 
-    # 先将生成的原始样本（反归一化后）保存到 generated_samples_raw
-    sampled_seqs_np = sampled_seqs.squeeze(1).cpu().numpy()   # (N, L)
-    # denormalize from [-1,1] back to original physical range
-    sampled_seqs_denorm = (sampled_seqs_np + 1.0) * 0.5 * (signal_max - signal_min) + signal_min
+    condA = norm_cond(1000.0, 30.0)  # low rpm
+    condB = norm_cond(3000.0, 30.0)  # high rpm
+
+    batch_size = 4
+    condA_batch = torch.tensor([condA] * batch_size, dtype=torch.float32)
+    condB_batch = torch.tensor([condB] * batch_size, dtype=torch.float32)
+
+    print("Sampling conditioned signals for physical-consistency check...")
+    try:
+        samplesA = trainer.sample_with_condition(batch_size=batch_size, cond=condA_batch)
+        samplesB = trainer.sample_with_condition(batch_size=batch_size, cond=condB_batch)
+    except Exception as e:
+        print("trainer.sample_with_condition failed, falling back to diffusion.sample:", e)
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        samplesA = diffusion.sample(batch_size=batch_size, model_forward_kwargs={'cond': condA_batch.to(device)})
+        samplesB = diffusion.sample(batch_size=batch_size, model_forward_kwargs={'cond': condB_batch.to(device)})
+
+    samplesA = samplesA.detach().cpu().numpy()
+    samplesB = samplesB.detach().cpu().numpy()
+
+    sigA = samplesA[0, 0, :]
+    sigB = samplesB[0, 0, :]
+
+
+    def compute_fft(sig, fs, n_fft=8192):  # 补0到 8192 点
+        L = sig.shape[-1]
+        # n=n_fft 表示进行 FFT 时使用的点数，不足的部分 numpy 会自动补 0
+        fft_vals = np.fft.rfft(sig, n=n_fft)
+
+        # 计算对应的频率轴，注意这里要用 n_fft
+        freqs = np.fft.rfftfreq(n_fft, d=1.0 / fs)
+
+        mag = np.abs(fft_vals)
+        return freqs, mag
+
+    freqsA, magA = compute_fft(sigA, FS)
+    freqsB, magB = compute_fft(sigB, FS)
+
+    def dominant_peak(freqs, mag, fmin=1.0):
+        mask = freqs > fmin
+        idx = np.argmax(mag[mask])
+        masked_idxs = np.nonzero(mask)[0]
+        return freqs[masked_idxs[idx]], mag[masked_idxs[idx]]
+
+    peakA_freq, peakA_mag = dominant_peak(freqsA, magA)
+    peakB_freq, peakB_mag = dominant_peak(freqsB, magB)
+
+    print(f"Dominant peak A (1000 RPM): {peakA_freq:.2f} Hz, mag {peakA_mag:.3f}")
+    print(f"Dominant peak B (3000 RPM): {peakB_freq:.2f} Hz, mag {peakB_mag:.3f}")
+    if peakA_freq > 0:
+        print(f"Frequency ratio B/A: {peakB_freq/peakA_freq:.3f} (expect ~3.0)")
+
+    # plot FFT comparison
+    plt.figure(figsize=(10, 6))
+    plt.plot(freqsA, magA / (magA.max() + 1e-12), label='Cond A (1000 RPM)', alpha=0.8)
+    plt.plot(freqsB, magB / (magB.max() + 1e-12), label='Cond B (3000 RPM)', alpha=0.8)
+    plt.xlim(0, 500)
+    plt.xlabel('Frequency (Hz)')
+    plt.ylabel('Normalized magnitude')
+    plt.title('FFT: Cond A (1000 RPM) vs Cond B (3000 RPM)')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    os.makedirs('./results_vibration', exist_ok=True)
+    plt.savefig('./results_vibration/fft_condition_comparison.png', dpi=200)
+    plt.close()
+
+    print("Saved FFT comparison to './results_vibration/fft_condition_comparison.png'")
+
+    # ---------- generate larger batch and run UCFilter as before ----------
+    print("Generating bulk samples and running UCFilter...")
+    sampled_seqs = diffusion.sample(batch_size=64)
+    sampled_seqs_np = sampled_seqs.squeeze(1).cpu().numpy()
 
     raw_folder = './generated_samples_raw'
     os.makedirs(raw_folder, exist_ok=True)
-    # 保存为整体 .npy 以及每个样本为单独文件，便于后续查看
-    np.save(os.path.join(raw_folder, 'all_generated.npy'), sampled_seqs_denorm)
-    for i, sig in enumerate(sampled_seqs_denorm):
-        np.save(os.path.join(raw_folder, f'raw_generated_signal_{i}.npy'), sig)
+    np.save(os.path.join(raw_folder, 'all_generated.npy'), sampled_seqs_np)
 
-    # 使用 UCFilter 选择高质量样本（基于 KL 代价）
-    print("Applying UCFilter to select high-quality generated samples...")
     with torch.no_grad():
-        # UCFilter 期望输入 (N, C, L) 的 tensor
         selected_idx, kl_scores, cluster_labels = ucfilter_kmeans_select_indices(
             sampled_seqs.detach().cpu(),
-            num_clusters = 3,  # 可根据数据分布调整聚类簇数
-            k_ratio = 0.9,     # 在每个簇内保留 KL 代价较小的前 90% 样本
+            num_clusters = 3,
+            k_ratio = 0.9,
             sigma = 1.0,
             embed_dim = 2,
         )
 
     selected_idx_np = selected_idx.numpy()
-    print(f"Total generated: {sampled_seqs.shape[0]}, selected by UCFilter: {len(selected_idx_np)}")
+    sampled_filtered = sampled_seqs_np[selected_idx_np]
 
-    # 仅对通过 UCFilter 的样本做反归一化与保存（已经反归一化为 sampled_seqs_denorm）
-    sampled_filtered = sampled_seqs_denorm[selected_idx_np]
-
-    # 保存筛选结果以及元数据
     filtered_folder = './generated_samples'
     os.makedirs(filtered_folder, exist_ok=True)
-
-    # 保存索引与 KL 分数，便于审计/复现
     np.save(os.path.join(filtered_folder, 'selected_idx.npy'), selected_idx_np)
-    # kl_scores 可能是 Tensor，转 numpy
     try:
         kl_np = kl_scores.numpy()
     except Exception:
@@ -178,4 +254,4 @@ if __name__ == '__main__':
         np.save(os.path.join(filtered_folder, f'generated_signal_{i}.npy'), gen_signal)
         print(f"Saved UCFilter-selected generated signal {i} (orig idx={idx}) to {os.path.join(filtered_folder, f'generated_signal_{i}.npy')}")
 
-    print("\nTraining completed!")
+    print("\nScript completed.")

@@ -22,7 +22,8 @@ from ema_pytorch import EMA
 
 from tqdm.auto import tqdm
 
-from denoising_diffusion_pytorch.version import __version__
+# from denoising_diffusion_pytorch.version import __version__
+__version__ = "1.0.0"
 import inspect
 
 # constants
