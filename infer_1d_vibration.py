@@ -51,6 +51,7 @@ def build_model_and_diffusion(seq_length: int, channels: int) -> GaussianDiffusi
         seq_length=seq_length,
         timesteps=1000,
         objective="pred_v",
+        auto_normalize=False,
     )
 
     return diffusion
@@ -104,7 +105,7 @@ def main():
     SEQ_LENGTH = 1024
     CHANNELS = 1
     RESULTS_FOLDER = "./results_vibration"
-    MAT_FILE_PATH = r"D:\PostGraduate\YearOne\HIL\data\simple_bearing\ball\9005k.mat"
+    MAT_FILE_PATH = r"D:\haoran\数据集\simple_bearing\simple_bearing\ball\9005k.mat"
     CUTOFF_POINTS = 5000
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -132,6 +133,17 @@ def main():
     with torch.no_grad():
         sampled = diffusion.sample(batch_size=num_samples)  # (N, C, L)
 
+    # 保存原始生成样本（反归一化）到 generated_samples_infer_raw
+    sampled_np = sampled.squeeze(1).cpu().numpy()  # (N, L)
+    # denormalize from [-1, 1] back to original physical range
+    sampled_denorm = (sampled_np + 1.0) * 0.5 * (signal_max - signal_min) + signal_min
+
+    raw_folder = './generated_samples_infer_raw'
+    os.makedirs(raw_folder, exist_ok=True)
+    np.save(os.path.join(raw_folder, 'all_generated.npy'), sampled_denorm)
+    for i, sig in enumerate(sampled_denorm):
+        np.save(os.path.join(raw_folder, f'raw_infer_signal_{i}.npy'), sig)
+
     # 6) 使用 UCFilter（K-means + KL 边界）筛选高质量样本
     print("Applying UCFilter (K-means + KL) to sampled sequences...")
     with torch.no_grad():
@@ -147,16 +159,23 @@ def main():
     print(f"Total sampled: {sampled.shape[0]}, selected by UCFilter: {len(selected_idx_np)}")
 
     # 7) 反归一化到原始物理量级（与训练脚本一致）
-    sampled_np = sampled.squeeze(1).cpu().numpy()  # (N, L)
-    sampled_denorm = sampled_np * (signal_max - signal_min) + signal_min
+    sampled_denorm = sampled_denorm
     sampled_filtered = sampled_denorm[selected_idx_np]
 
     # 8) 保存生成且通过 UCFilter 筛选的样本到 ./generated_samples_infer
     save_folder = "./generated_samples_infer"
     os.makedirs(save_folder, exist_ok=True)
 
+    # 保存索引与 KL 分数
+    np.save(os.path.join(save_folder, 'selected_idx.npy'), selected_idx_np)
+    try:
+        kl_np = kl_scores.numpy()
+    except Exception:
+        kl_np = np.array(kl_scores)
+    np.save(os.path.join(save_folder, 'kl_scores.npy'), kl_np)
+
     for i, (idx, sig) in enumerate(zip(selected_idx_np, sampled_filtered)):
-        out_path = os.path.join(save_folder, f"infer_signal_{i}.npy")
+        out_path = os.path.join(save_folder, f'infer_signal_{i}.npy')
         np.save(out_path, sig)
         print(f"Saved UCFilter-selected generated signal #{i} (orig idx={idx}) to {out_path}")
 

@@ -32,7 +32,7 @@ if __name__ == '__main__':
     if device.type == 'cuda':
         print(f"GPU Name: {torch.cuda.get_device_name(0)}")
 
-    mat_file_path = r'D:\PostGraduate\YearOne\HIL\data\simple_bearing\ball\9005k.mat'
+    mat_file_path = r'D:\haoran\数据集\simple_bearing\simple_bearing\ball\9005k.mat'
     print(f"Loading data from {mat_file_path}...")
     mat_data = loadmat(mat_file_path)
 
@@ -62,16 +62,18 @@ if __name__ == '__main__':
     # 参数设置
     SEQ_LENGTH = 1024  # 序列长度，可以根据需要调整 (128, 256, 512, 1024 等)
     CHANNELS = 1  # 单通道信号
-    OVERLAP = 0.5  # 重叠比例，用于生成更多训练样本
+    OVERLAP = 0.8  # 重叠比例，用于生成更多训练样本
 
     # 创建样本
     samples = create_samples(signal, SEQ_LENGTH, OVERLAP)
     print(f"Created {len(samples)} samples of length {SEQ_LENGTH}")
 
-    # 归一化数据到 [0, 1] 范围
+    # 归一化数据到 [-1, 1] 范围（之前是 [0,1]）
     signal_min = samples.min()
     signal_max = samples.max()
-    samples_normalized = (samples - signal_min) / (signal_max - signal_min + 1e-8)
+    # avoid division by zero
+    denom = (signal_max - signal_min) + 1e-8
+    samples_normalized = 2.0 * (samples - signal_min) / denom - 1.0
 
     print(f"Normalized range: [{samples_normalized.min():.4f}, {samples_normalized.max():.4f}]")
 
@@ -100,7 +102,8 @@ if __name__ == '__main__':
         model,
         seq_length = SEQ_LENGTH,
         timesteps = 1000,
-        objective = 'pred_v'
+        objective = 'pred_v',
+        auto_normalize = False,
     )
 
     # 创建训练器
@@ -114,7 +117,9 @@ if __name__ == '__main__':
         ema_decay = 0.995,
         amp = True,  # 混合精度训练
         save_and_sample_every = 1000,  # 每1000步保存一次
-        results_folder = './results_vibration'
+        results_folder = './results_vibration',
+        denorm_min = float(signal_min),
+        denorm_max = float(signal_max),
     )
 
     # 开始训练
@@ -125,6 +130,18 @@ if __name__ == '__main__':
     print("\nGenerating samples...")
     sampled_seqs = diffusion.sample(batch_size = 64)  # 先生成一定数量的样本
     print(f"Generated samples shape: {sampled_seqs.shape}")  # (N, 1, L)
+
+    # 先将生成的原始样本（反归一化后）保存到 generated_samples_raw
+    sampled_seqs_np = sampled_seqs.squeeze(1).cpu().numpy()   # (N, L)
+    # denormalize from [-1,1] back to original physical range
+    sampled_seqs_denorm = (sampled_seqs_np + 1.0) * 0.5 * (signal_max - signal_min) + signal_min
+
+    raw_folder = './generated_samples_raw'
+    os.makedirs(raw_folder, exist_ok=True)
+    # 保存为整体 .npy 以及每个样本为单独文件，便于后续查看
+    np.save(os.path.join(raw_folder, 'all_generated.npy'), sampled_seqs_denorm)
+    for i, sig in enumerate(sampled_seqs_denorm):
+        np.save(os.path.join(raw_folder, f'raw_generated_signal_{i}.npy'), sig)
 
     # 使用 UCFilter 选择高质量样本（基于 KL 代价）
     print("Applying UCFilter to select high-quality generated samples...")
@@ -141,15 +158,24 @@ if __name__ == '__main__':
     selected_idx_np = selected_idx.numpy()
     print(f"Total generated: {sampled_seqs.shape[0]}, selected by UCFilter: {len(selected_idx_np)}")
 
-    # 仅对通过 UCFilter 的样本做反归一化与保存
-    sampled_seqs_np = sampled_seqs.squeeze(1).cpu().numpy()   # (N, L)
-    sampled_seqs_denorm = sampled_seqs_np * (signal_max - signal_min) + signal_min
+    # 仅对通过 UCFilter 的样本做反归一化与保存（已经反归一化为 sampled_seqs_denorm）
     sampled_filtered = sampled_seqs_denorm[selected_idx_np]
 
-    # 保存生成且通过 UCFilter 筛选的样本
-    os.makedirs('./generated_samples', exist_ok=True)
+    # 保存筛选结果以及元数据
+    filtered_folder = './generated_samples'
+    os.makedirs(filtered_folder, exist_ok=True)
+
+    # 保存索引与 KL 分数，便于审计/复现
+    np.save(os.path.join(filtered_folder, 'selected_idx.npy'), selected_idx_np)
+    # kl_scores 可能是 Tensor，转 numpy
+    try:
+        kl_np = kl_scores.numpy()
+    except Exception:
+        kl_np = np.array(kl_scores)
+    np.save(os.path.join(filtered_folder, 'kl_scores.npy'), kl_np)
+
     for i, (idx, gen_signal) in enumerate(zip(selected_idx_np, sampled_filtered)):
-        np.save(f'./generated_samples/generated_signal_{i}.npy', gen_signal)
-        print(f"Saved UCFilter-selected generated signal {i} (orig idx={idx}) to ./generated_samples/generated_signal_{i}.npy")
+        np.save(os.path.join(filtered_folder, f'generated_signal_{i}.npy'), gen_signal)
+        print(f"Saved UCFilter-selected generated signal {i} (orig idx={idx}) to {os.path.join(filtered_folder, f'generated_signal_{i}.npy')}")
 
     print("\nTraining completed!")
