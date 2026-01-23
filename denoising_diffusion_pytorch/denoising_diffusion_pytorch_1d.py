@@ -23,6 +23,7 @@ from ema_pytorch import EMA
 from tqdm.auto import tqdm
 
 from denoising_diffusion_pytorch.version import __version__
+import inspect
 
 # constants
 
@@ -73,15 +74,42 @@ def unnormalize_to_zero_to_one(t):
 # data
 
 class Dataset1D(Dataset):
-    def __init__(self, tensor: Tensor):
+    """
+    Dataset wrapper for 1D signals with optional per-sample condition vectors.
+
+    - signals: Tensor of shape (N, C, L)
+    - conditions: Tensor of shape (N, cond_dim) or (N, cond_dim, L) or None
+
+    __getitem__ returns (signal, cond) where cond is either a Tensor (possibly with time dim)
+    or an empty tensor of shape (0,) when no conditions are provided.
+    """
+    def __init__(self, signals: Tensor, conditions: Tensor | None = None):
         super().__init__()
-        self.tensor = tensor.clone()
+        assert isinstance(signals, torch.Tensor), 'signals must be a torch.Tensor'
+        # store signals as float32 copy
+        self.signals = signals.clone().detach().float()
+
+        n = len(self.signals)
+
+        if exists(conditions):
+            assert isinstance(conditions, torch.Tensor), 'conditions must be a torch.Tensor or None'
+            assert len(conditions) == n, 'conditions must match signals length'
+            # keep a float32 detached copy
+            self.conditions = conditions.clone().detach().float()
+        else:
+            # default to an empty condition tensor (will be interpreted as None downstream)
+            self.conditions = torch.zeros((n, 0), dtype=torch.float32)
 
     def __len__(self):
-        return len(self.tensor)
+        return len(self.signals)
 
     def __getitem__(self, idx):
-        return self.tensor[idx].clone()
+        sig = self.signals[idx].clone()
+        if self.conditions.numel() != 0:
+            cond = self.conditions[idx].clone()
+        else:
+            cond = torch.zeros(0, dtype=torch.float32)
+        return sig, cond
 
 # small helper modules
 
@@ -618,7 +646,7 @@ class PhysiNet(Module):
             x_self_cond = default(x_self_cond, lambda: torch.zeros_like(x))
             x = torch.cat((x_self_cond, x), dim = 1)
 
-        # 3) Lifting：将输入提升到高维特征空间 v0(x)
+        # 3) Lifting：将输入提升到高维特征 v0(x)
         v0 = self.init_conv(x)                       # (B, C_lift, L)
 
         # 4) U-Fourier Layer：得到物理驱动故障分量 P_{i,t}(x)
@@ -1069,12 +1097,31 @@ class GaussianDiffusion1D(Module):
         posterior_log_variance_clipped = extract(self.posterior_log_variance_clipped, t, x_t.shape)
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
-    def model_predictions(self, x, t, x_self_cond = None, clip_x_start = False, rederive_pred_noise = False, model_forward_kwargs: dict = dict()):
+    def model_predictions(self, x, t, x_self_cond = None, clip_x_start = False, rederive_pred_noise = False, model_forward_kwargs: dict = dict(), **kwargs):
+        """Call the underlying model to produce either predicted noise, x0 or v depending on objective.
+        Filters model_forward_kwargs to only arguments accepted by model.forward to avoid TypeError when
+        passing 'cond' to models that don't accept it.
+        """
+        # merge any kwargs (e.g., if caller did model_predictions(x,t, **model_forward_kwargs))
+        if len(kwargs) > 0:
+            model_forward_kwargs = {**model_forward_kwargs, **kwargs}
 
         if exists(x_self_cond):
             model_forward_kwargs = {**model_forward_kwargs, 'self_cond': x_self_cond}
 
+        # filter model_forward_kwargs to only those accepted by the underlying model
+        try:
+            sig = inspect.signature(self.model.forward)
+            accepts_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+            if not accepts_var_kw:
+                allowed = set(sig.parameters.keys()) - {'self'}
+                model_forward_kwargs = {k: v for k, v in model_forward_kwargs.items() if k in allowed}
+        except Exception:
+            # if introspection fails, fall back to passing kwargs as-is
+            pass
+
         model_output = self.model(x, t, **model_forward_kwargs)
+
         maybe_clip = partial(torch.clamp, min = -1., max = 1.) if clip_x_start else identity
 
         if self.objective == 'pred_noise':
@@ -1096,6 +1143,9 @@ class GaussianDiffusion1D(Module):
             x_start = maybe_clip(x_start)
             pred_noise = self.predict_noise_from_start(x, t, x_start)
 
+        else:
+            raise ValueError(f'unknown objective {self.objective}')
+
         return ModelPrediction(pred_noise, x_start)
 
     def p_mean_variance(self, x, t, x_self_cond = None, clip_denoised = True, model_forward_kwargs: dict = dict()):
@@ -1103,7 +1153,8 @@ class GaussianDiffusion1D(Module):
         if exists(x_self_cond):
             model_forward_kwargs = {**model_forward_kwargs, 'self_cond': x_self_cond}
 
-        preds = self.model_predictions(x, t, **model_forward_kwargs)
+        # pass model_forward_kwargs as the named parameter so it gets routed inside model_predictions
+        preds = self.model_predictions(x, t, model_forward_kwargs = model_forward_kwargs)
         x_start = preds.pred_x_start
 
         if clip_denoised:
@@ -1245,6 +1296,16 @@ class GaussianDiffusion1D(Module):
 
         # predict and take gradient step
 
+        # filter model_forward_kwargs similarly before calling the model
+        try:
+            sig = inspect.signature(self.model.forward)
+            accepts_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+            if not accepts_var_kw:
+                allowed = set(sig.parameters.keys()) - {'self'}
+                model_forward_kwargs = {k: v for k, v in model_forward_kwargs.items() if k in allowed}
+        except Exception:
+            pass
+
         model_out = self.model(x, t, **model_forward_kwargs)
 
         if self.objective == 'pred_noise':
@@ -1275,7 +1336,18 @@ class GaussianDiffusion1D(Module):
         t = torch.randint(0, self.num_timesteps, (b,), device=device).long()  #随机采样时间步
 
         img = self.normalize(img)
-        return self.p_losses(img, t, *args, **kwargs)
+
+        # Extract optional condition and model_forward_kwargs, merge and pass into p_losses
+        cond = kwargs.pop('cond', None)
+        model_forward_kwargs = kwargs.pop('model_forward_kwargs', {})
+        if cond is not None:
+            # pass condition to the underlying model (PhysiNet expects 'cond' kwarg)
+            model_forward_kwargs = {**model_forward_kwargs, 'cond': cond}
+
+        noise = kwargs.pop('noise', None)
+        return_reduced = kwargs.pop('return_reduced_loss', True)
+
+        return self.p_losses(img, t, noise = noise, model_forward_kwargs = model_forward_kwargs, return_reduced_loss = return_reduced)
 
 # trainer class
 
@@ -1411,10 +1483,24 @@ class Trainer1D(object):
                 total_loss = 0.
 
                 for _ in range(self.gradient_accumulate_every): #gradient_accumulate_every是等效批，即等效批次 = batchsize * gradient_accumulate_every
-                    data = next(self.dl).to(device)  #取一个batch的样本
+                    batch = next(self.dl)
+                    # dataloader may return (data, cond) or just data
+                    if isinstance(batch, (list, tuple)) and len(batch) == 2:
+                        data, cond = batch
+                    else:
+                        data = batch
+                        cond = None
+
+                    # move tensors to device (safe even if already on device)
+                    data = data.to(device)
+                    if isinstance(cond, torch.Tensor) and cond.numel() != 0:
+                        cond = cond.to(device)
+                    else:
+                        cond = None
 
                     with self.accelerator.autocast():
-                        loss = self.model(data)
+                        # pass condition through the diffusion wrapper; GaussianDiffusion1D.forward will forward cond
+                        loss = self.model(data, cond=cond)
                         loss = loss / self.gradient_accumulate_every
                         total_loss += loss.item()
 
@@ -1484,3 +1570,53 @@ class Trainer1D(object):
                 pbar.update(1)
 
         accelerator.print('training complete')
+
+    def sample_with_condition(self, batch_size = 16, cond: torch.Tensor | None = None, return_noise = False, model_forward_kwargs: dict = None):
+        """
+        使用 EMA 模型进行条件采样（如果可用）。
+
+        输入
+        - batch_size: 批次大小；
+        - return_noise: 是否返回噪声；
+        - model_forward_kwargs: 传递给模型前向传播的其他参数。
+
+        输出
+        - 生成的样本。
+        """
+        if not self.accelerator.is_main_process:
+            return None
+
+        if not hasattr(self, 'ema') or self.ema is None:
+            print("EMA model is not available, falling back to standard sampling.")
+            return self.sample(batch_size = batch_size, return_noise = return_noise, model_forward_kwargs = model_forward_kwargs or {})
+
+        device = self.device
+
+        with torch.no_grad():
+            self.ema.ema_model.eval()
+
+            # determine cond_dim from underlying model (diffusion wrapper may hold model at .model)
+            cond_dim = None
+            if hasattr(self.model, 'cond_dim'):
+                cond_dim = getattr(self.model, 'cond_dim')
+            elif hasattr(self.model, 'model') and hasattr(self.model.model, 'cond_dim'):
+                cond_dim = getattr(self.model.model, 'cond_dim')
+
+            # use provided cond if given; otherwise sample a random cond only if we know cond_dim
+            if cond is None:
+                if cond_dim is None or cond_dim == 0:
+                    # no conditioning supported; leave cond as None
+                    cond = None
+                else:
+                    cond = torch.randn(batch_size, cond_dim, device = device)
+            else:
+                # ensure on device and right dtype
+                cond = cond.to(device)
+
+            mfw = dict(model_forward_kwargs or {})
+            mfw['cond'] = cond
+
+            # 生成样本 using EMA model
+            img = self.ema.ema_model.sample(batch_size = batch_size, return_noise = return_noise, model_forward_kwargs = mfw)
+
+        return img
