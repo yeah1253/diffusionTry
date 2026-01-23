@@ -1298,7 +1298,9 @@ class Trainer1D(object):
         amp = False,
         mixed_precision_type = 'fp16',
         split_batches = True,
-        max_grad_norm = 1.
+        max_grad_norm = 1.,
+        denorm_min: float | None = None,
+        denorm_max: float | None = None,
     ):
         super().__init__()
 
@@ -1313,6 +1315,9 @@ class Trainer1D(object):
 
         self.model = diffusion_model
         self.channels = diffusion_model.channels
+        # optional denormalization range (used to convert model outputs back to physical units for plotting)
+        self.denorm_min = denorm_min
+        self.denorm_max = denorm_max
 
         # sampling and training hyperparameters
 
@@ -1442,6 +1447,16 @@ class Trainer1D(object):
                         try:
                             # 转换到 CPU 并转为 numpy，形状通常是 (Batch, Channels, Length)
                             samples_np = all_samples.detach().cpu().numpy()
+
+                            # 如果设置了 denorm 范围（signal_min/signal_max），先把 samples 从模型范围（[-1,1]）反归一化到物理量级
+                            if getattr(self, 'denorm_min', None) is not None and getattr(self, 'denorm_max', None) is not None:
+                                try:
+                                    den_min = float(self.denorm_min)
+                                    den_max = float(self.denorm_max)
+                                    samples_np = (samples_np + 1.0) * 0.5 * (den_max - den_min) + den_min
+                                except Exception:
+                                    # 若发生任何错误，保留原始 samples_np
+                                    pass
 
                             plt.figure(figsize=(12, 6))
                             # 只画前 4 个样本，避免图太乱
