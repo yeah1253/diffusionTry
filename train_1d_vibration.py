@@ -1,7 +1,9 @@
 import torch
 import numpy as np
 import os
-# from scipy.io import loadmat  # no longer needed for synthetic dataset
+from scipy.io import loadmat
+import glob
+import re
 
 # 直接从一维扩散子模块中导入 PhysiNet / GaussianDiffusion1D 等，
 # 避免依赖外部已安装的 denoising_diffusion_pytorch 包版本中可能不存在 PhysiNet 的问题。
@@ -15,7 +17,111 @@ from denoising_diffusion_pytorch.denoising_diffusion_pytorch_1d import (
 
 import matplotlib.pyplot as plt
 
-# Synthetic SDUST-like dataset implementation
+# Real SDUST bearing dataset loader
+class RealSDUSTDataset(torch.utils.data.Dataset):
+    """
+    从真实 SDUST 轴承数据集中加载数据。
+    
+    从指定路径下的所有 .mat 文件中加载 Signal.y_values 的第一列数据。
+    将长序列分割成固定长度的样本用于训练。
+    
+    参数:
+    - data_path: .mat 文件所在目录
+    - seq_length: 每个样本的序列长度
+    - overlap: 滑动窗口的重叠比例 (0-1)
+    - use_condition: 是否使用条件（从文件名提取 RPM），如果 False 则 cond_dim=0
+    """
+    def __init__(self, data_path, seq_length=1024, overlap=0.5, use_condition=False):
+        super().__init__()
+        self.seq_length = int(seq_length)
+        self.overlap = float(overlap)
+        self.use_condition = use_condition
+        
+        # 查找所有 .mat 文件
+        mat_files = glob.glob(os.path.join(data_path, '*.mat'))
+        if len(mat_files) == 0:
+            raise ValueError(f"No .mat files found in {data_path}")
+        
+        print(f"Found {len(mat_files)} .mat files in {data_path}")
+        
+        # 加载所有数据
+        all_signals = []
+        all_conditions = []
+        
+        for mat_file in sorted(mat_files):
+            print(f"Loading {os.path.basename(mat_file)}...")
+            try:
+                data = loadmat(mat_file)
+                
+                # 提取 y_values 的第一列
+                signal = data['Signal']['y_values'][0, 0]['values'].item()[:, 0]
+                
+                # 从文件名提取 RPM（如果启用条件）
+                rpm = None
+                if self.use_condition:
+                    # 尝试从文件名提取数字（如 "NC 1000 0.mat" -> 1000）
+                    match = re.search(r'(\d+)', os.path.basename(mat_file))
+                    if match:
+                        rpm = float(match.group(1))
+                    else:
+                        rpm = 2000.0  # 默认值
+                
+                # 将长序列分割成多个样本
+                samples = create_samples(signal, self.seq_length, self.overlap)
+                
+                for sample in samples:
+                    all_signals.append(sample.astype(np.float32))
+                    if self.use_condition and rpm is not None:
+                        # 归一化 RPM: 假设范围 1000-3000
+                        norm_rpm = (rpm - 1000.0) / 2000.0
+                        all_conditions.append(np.array([norm_rpm], dtype=np.float32))
+                
+                print(f"  Extracted {len(samples)} samples from {len(signal)} data points")
+                
+            except Exception as e:
+                print(f"  Warning: Failed to load {mat_file}: {e}")
+                continue
+        
+        if len(all_signals) == 0:
+            raise ValueError("No valid samples extracted from .mat files")
+        
+        # 堆叠所有样本
+        self.signals = np.stack(all_signals, axis=0)  # (N, L)
+        
+        # 归一化信号到 [-1, 1]，并保存归一化参数用于后续反归一化
+        self.signal_min = self.signals.min()
+        self.signal_max = self.signals.max()
+        signal_range = self.signal_max - self.signal_min + 1e-8
+        self.signals = 2.0 * (self.signals - self.signal_min) / signal_range - 1.0
+        
+        print(f"Signal normalization: min={self.signal_min:.4f}, max={self.signal_max:.4f}")
+        print(f"Normalized range: [{self.signals.min():.4f}, {self.signals.max():.4f}]")
+        
+        # 条件信息
+        if self.use_condition and len(all_conditions) > 0:
+            self.conditions = np.stack(all_conditions, axis=0)  # (N, 1)
+            self.cond_dim = 1
+        else:
+            self.conditions = None
+            self.cond_dim = 0
+        
+        print(f"Total dataset size: {len(self.signals)} samples")
+        print(f"Condition dimension: {self.cond_dim}")
+    
+    def __len__(self):
+        return len(self.signals)
+    
+    def __getitem__(self, idx):
+        sig = torch.from_numpy(self.signals[idx]).unsqueeze(0)  # (1, L)
+        
+        if self.use_condition and self.conditions is not None:
+            cond = torch.from_numpy(self.conditions[idx])  # (1,)
+            return sig, cond
+        else:
+            return sig
+
+
+# Synthetic SDUST-like dataset implementation (保留作为参考)
 class SyntheticSDUSTDataset(torch.utils.data.Dataset):
     """
     Synthetic dataset mimicking SDUST bearing signals controlled by RPM and Load.
@@ -99,20 +205,26 @@ if __name__ == '__main__':
     if device.type == 'cuda':
         print(f"GPU Name: {torch.cuda.get_device_name(0)}")
 
-    # ---------- dataset configuration (synthetic SDUST) ----------
+    # ---------- dataset configuration (real SDUST data) ----------
     SEQ_LENGTH = 1024
-    FS = 25600.0
-    N_SAMPLES = 2048
+    DATA_PATH = r'D:\山东科技大学轴承齿轮数据集\轴承数据集\speed'
+    OVERLAP = 0.5  # 滑动窗口重叠比例
+    USE_CONDITION = False  # 是否使用条件（从文件名提取 RPM），False 表示无条件生成
 
-    print("Creating synthetic SDUST-like dataset...")
-    dataset = SyntheticSDUSTDataset(n_samples=N_SAMPLES, seq_length=SEQ_LENGTH, fs=FS, seed=42)
-    print(f"Dataset size: {len(dataset)}, seq_length={SEQ_LENGTH}, fs={FS}")
+    print(f"Loading real SDUST dataset from {DATA_PATH}...")
+    dataset = RealSDUSTDataset(
+        data_path=DATA_PATH,
+        seq_length=SEQ_LENGTH,
+        overlap=OVERLAP,
+        use_condition=USE_CONDITION
+    )
+    print(f"Dataset size: {len(dataset)}, seq_length={SEQ_LENGTH}")
 
-    # ---------- model and diffusion (enable cond_dim=2) ----------
+    # ---------- model and diffusion ----------
     CHANNELS = 1
-    COND_DIM = 2
+    COND_DIM = dataset.cond_dim  # 根据数据集自动设置
 
-    print("Building PhysiNet (cond_dim=2)...")
+    print(f"Building PhysiNet (cond_dim={COND_DIM})...")
     model = PhysiNet(
         dim = 64,
         dim_mults = (1, 2, 4, 8),
@@ -144,85 +256,19 @@ if __name__ == '__main__':
         results_folder = './results_vibration',
     )
 
-    print("Starting training on synthetic dataset...")
+    print("Starting training on real SDUST dataset...")
     trainer.train()
     print("Training finished.")
 
-    # ---------- physical-consistency check: sample conditioned on two RPMs ----------
-    def norm_cond(rpm, load):
-        return np.array([(rpm - 1000.0) / 2000.0, load / 60.0], dtype=np.float32)
-
-    condA = norm_cond(1000.0, 30.0)  # low rpm
-    condB = norm_cond(3000.0, 30.0)  # high rpm
-
-    batch_size = 4
-    condA_batch = torch.tensor([condA] * batch_size, dtype=torch.float32)
-    condB_batch = torch.tensor([condB] * batch_size, dtype=torch.float32)
-
-    print("Sampling conditioned signals for physical-consistency check...")
-    try:
-        samplesA = trainer.sample_with_condition(batch_size=batch_size, cond=condA_batch)
-        samplesB = trainer.sample_with_condition(batch_size=batch_size, cond=condB_batch)
-    except Exception as e:
-        print("trainer.sample_with_condition failed, falling back to diffusion.sample:", e)
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        samplesA = diffusion.sample(batch_size=batch_size, model_forward_kwargs={'cond': condA_batch.to(device)})
-        samplesB = diffusion.sample(batch_size=batch_size, model_forward_kwargs={'cond': condB_batch.to(device)})
-
-    samplesA = samplesA.detach().cpu().numpy()
-    samplesB = samplesB.detach().cpu().numpy()
-
-    sigA = samplesA[0, 0, :]
-    sigB = samplesB[0, 0, :]
-
-
-    def compute_fft(sig, fs, n_fft=8192):  # 补0到 8192 点
-        L = sig.shape[-1]
-        # n=n_fft 表示进行 FFT 时使用的点数，不足的部分 numpy 会自动补 0
-        fft_vals = np.fft.rfft(sig, n=n_fft)
-
-        # 计算对应的频率轴，注意这里要用 n_fft
-        freqs = np.fft.rfftfreq(n_fft, d=1.0 / fs)
-
-        mag = np.abs(fft_vals)
-        return freqs, mag
-
-    freqsA, magA = compute_fft(sigA, FS)
-    freqsB, magB = compute_fft(sigB, FS)
-
-    def dominant_peak(freqs, mag, fmin=1.0):
-        mask = freqs > fmin
-        idx = np.argmax(mag[mask])
-        masked_idxs = np.nonzero(mask)[0]
-        return freqs[masked_idxs[idx]], mag[masked_idxs[idx]]
-
-    peakA_freq, peakA_mag = dominant_peak(freqsA, magA)
-    peakB_freq, peakB_mag = dominant_peak(freqsB, magB)
-
-    print(f"Dominant peak A (1000 RPM): {peakA_freq:.2f} Hz, mag {peakA_mag:.3f}")
-    print(f"Dominant peak B (3000 RPM): {peakB_freq:.2f} Hz, mag {peakB_mag:.3f}")
-    if peakA_freq > 0:
-        print(f"Frequency ratio B/A: {peakB_freq/peakA_freq:.3f} (expect ~3.0)")
-
-    # plot FFT comparison
-    plt.figure(figsize=(10, 6))
-    plt.plot(freqsA, magA / (magA.max() + 1e-12), label='Cond A (1000 RPM)', alpha=0.8)
-    plt.plot(freqsB, magB / (magB.max() + 1e-12), label='Cond B (3000 RPM)', alpha=0.8)
-    plt.xlim(0, 500)
-    plt.xlabel('Frequency (Hz)')
-    plt.ylabel('Normalized magnitude')
-    plt.title('FFT: Cond A (1000 RPM) vs Cond B (3000 RPM)')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    os.makedirs('./results_vibration', exist_ok=True)
-    plt.savefig('./results_vibration/fft_condition_comparison.png', dpi=200)
-    plt.close()
-
-    print("Saved FFT comparison to './results_vibration/fft_condition_comparison.png'")
-
     # ---------- generate larger batch and run UCFilter as before ----------
     print("Generating bulk samples and running UCFilter...")
-    sampled_seqs = diffusion.sample(batch_size=64)
+    # 根据是否有条件决定采样方式
+    if COND_DIM > 0:
+        # 如果有条件，使用随机条件或从数据集中采样条件
+        print("Note: Conditional generation is enabled, but using unconditional sampling for UCFilter")
+        sampled_seqs = diffusion.sample(batch_size=64)
+    else:
+        sampled_seqs = diffusion.sample(batch_size=64)
     sampled_seqs_np = sampled_seqs.squeeze(1).cpu().numpy()
 
     raw_folder = './generated_samples_raw'
@@ -241,6 +287,52 @@ if __name__ == '__main__':
     selected_idx_np = selected_idx.numpy()
     sampled_filtered = sampled_seqs_np[selected_idx_np]
 
+    # 反归一化生成的信号到原始尺度
+    # 从 [-1, 1] 反归一化到 [signal_min, signal_max]
+    signal_min = dataset.signal_min
+    signal_max = dataset.signal_max
+    signal_range = signal_max - signal_min + 1e-8
+    
+    # 反归一化公式：x_original = (x_norm + 1) / 2 * (max - min) + min
+    sampled_filtered_denorm = (sampled_filtered + 1.0) / 2.0 * signal_range + signal_min
+    
+    print(f"\n反归一化参数:")
+    print(f"  signal_min: {signal_min:.4f}")
+    print(f"  signal_max: {signal_max:.4f}")
+    print(f"  生成信号范围 (归一化): [{sampled_filtered.min():.4f}, {sampled_filtered.max():.4f}]")
+    print(f"  生成信号范围 (反归一化): [{sampled_filtered_denorm.min():.4f}, {sampled_filtered_denorm.max():.4f}]")
+    
+    # 幅值修正：基于训练数据的统计特性
+    # 计算训练数据的标准差和RMS
+    train_signals_original = dataset.signals  # 已经是归一化后的
+    # 反归一化训练数据用于计算统计量
+    train_signals_denorm = (train_signals_original + 1.0) / 2.0 * signal_range + signal_min
+    train_std = np.std(train_signals_denorm.flatten())
+    train_rms = np.sqrt(np.mean(train_signals_denorm.flatten()**2))
+    
+    # 计算生成信号的统计量
+    gen_std = np.std(sampled_filtered_denorm.flatten())
+    gen_rms = np.sqrt(np.mean(sampled_filtered_denorm.flatten()**2))
+    
+    # 计算修正系数（使用标准差，更稳定）
+    if gen_std > 1e-8:
+        amplitude_correction_factor = train_std / gen_std
+        print(f"\n幅值修正分析:")
+        print(f"  训练数据 std: {train_std:.4f}, RMS: {train_rms:.4f}")
+        print(f"  生成数据 std: {gen_std:.4f}, RMS: {gen_rms:.4f}")
+        print(f"  修正系数: {amplitude_correction_factor:.4f}")
+        
+        # 应用修正：保持均值不变，缩放波动部分
+        gen_mean = np.mean(sampled_filtered_denorm, axis=1, keepdims=True)
+        gen_centered = sampled_filtered_denorm - gen_mean
+        sampled_filtered_denorm = gen_mean + gen_centered * amplitude_correction_factor
+        
+        print(f"  修正后范围: [{sampled_filtered_denorm.min():.4f}, {sampled_filtered_denorm.max():.4f}]")
+        print(f"  修正后 std: {np.std(sampled_filtered_denorm.flatten()):.4f}")
+    else:
+        amplitude_correction_factor = 1.0
+        print(f"\n警告: 生成信号标准差过小，跳过幅值修正")
+
     filtered_folder = './generated_samples'
     os.makedirs(filtered_folder, exist_ok=True)
     np.save(os.path.join(filtered_folder, 'selected_idx.npy'), selected_idx_np)
@@ -249,8 +341,17 @@ if __name__ == '__main__':
     except Exception:
         kl_np = np.array(kl_scores)
     np.save(os.path.join(filtered_folder, 'kl_scores.npy'), kl_np)
+    
+    # 保存归一化参数和修正参数
+    np.save(os.path.join(filtered_folder, 'normalization_params.npy'), {
+        'signal_min': signal_min,
+        'signal_max': signal_max,
+        'amplitude_correction_factor': amplitude_correction_factor,
+        'train_std': train_std,
+        'train_rms': train_rms
+    })
 
-    for i, (idx, gen_signal) in enumerate(zip(selected_idx_np, sampled_filtered)):
+    for i, (idx, gen_signal) in enumerate(zip(selected_idx_np, sampled_filtered_denorm)):
         np.save(os.path.join(filtered_folder, f'generated_signal_{i}.npy'), gen_signal)
         print(f"Saved UCFilter-selected generated signal {i} (orig idx={idx}) to {os.path.join(filtered_folder, f'generated_signal_{i}.npy')}")
 

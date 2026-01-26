@@ -10,7 +10,7 @@ from scipy.fft import fft
 from scipy.signal import find_peaks
 
 # ===== 配置参数 =====
-REAL_DATA_PATH = r'D:\PostGraduate\YearOne\HIL\data\simple_bearing\ball\9005k.mat'
+REAL_DATA_PATH = r'D:\山东科技大学轴承齿轮数据集\轴承数据集\NC\NC 2000 0.mat'
 REAL_SIGNAL_NAME = 'Bearing_Acc_X'
 GENERATED_DIR = './generated_samples'
 FS = 5000  # Hz
@@ -200,17 +200,45 @@ if __name__ == '__main__':
     print('\n[1] 加载真实数据...')
     try:
         real_struct = loadmat(REAL_DATA_PATH)
-        if REAL_SIGNAL_NAME in real_struct:
+        
+        # 优先尝试从 Signal.y_values 中提取第一列数据（与训练数据格式一致）
+        if 'Signal' in real_struct:
+            try:
+                signal_data = real_struct['Signal']
+                if hasattr(signal_data, 'dtype') and signal_data.dtype.names and 'y_values' in signal_data.dtype.names:
+                    # 提取 y_values 的第一列
+                    y_values = signal_data['y_values'][0, 0]
+                    if 'values' in y_values.dtype.names:
+                        real_signal = y_values['values'].item()[:, 0]  # 第一列
+                        print('成功从 Signal.y_values 中提取第一列数据')
+                    else:
+                        raise ValueError('Signal.y_values 中未找到 values 字段')
+                else:
+                    raise ValueError('Signal 结构不符合预期格式')
+            except Exception as e:
+                print(f'从 Signal.y_values 提取失败: {e}')
+                print('尝试备用方法...')
+                # 备用方法：尝试直接使用 REAL_SIGNAL_NAME
+                if REAL_SIGNAL_NAME in real_struct:
+                    real_signal = real_struct[REAL_SIGNAL_NAME]
+                    print(f'成功从真实数据中提取 {REAL_SIGNAL_NAME}')
+                else:
+                    print('提示：真实数据中未找到同名变量，尝试自动提取主信号...')
+                    real_signal = get_largest_vector(real_struct)
+        elif REAL_SIGNAL_NAME in real_struct:
             real_signal = real_struct[REAL_SIGNAL_NAME]
             print(f'成功从真实数据中提取 {REAL_SIGNAL_NAME}')
         else:
-            print('提示：真实数据中未找到同名变量，尝试自动提取主信号...')
+            print('提示：真实数据中未找到 Signal 或指定变量，尝试自动提取主信号...')
             real_signal = get_largest_vector(real_struct)
         
         real_signal = real_signal.flatten().astype(np.float64)
         print(f'真实信号长度: {len(real_signal)}')
+        print(f'真实信号范围: [{real_signal.min():.4f}, {real_signal.max():.4f}]')
     except Exception as e:
         print(f'加载真实数据失败: {e}')
+        import traceback
+        traceback.print_exc()
         raise
     
     # 2. 加载生成的信号
