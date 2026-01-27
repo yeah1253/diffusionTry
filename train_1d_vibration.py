@@ -209,7 +209,7 @@ if __name__ == '__main__':
     SEQ_LENGTH = 1024
     DATA_PATH = r'D:\山东科技大学轴承齿轮数据集\轴承数据集\speed'
     OVERLAP = 0.5  # 滑动窗口重叠比例
-    USE_CONDITION = False  # 是否使用条件（从文件名提取 RPM），False 表示无条件生成
+    USE_CONDITION = True  # 是否使用条件（从文件名提取 RPM），False 表示无条件生成
 
     print(f"Loading real SDUST dataset from {DATA_PATH}...")
     dataset = RealSDUSTDataset(
@@ -260,14 +260,44 @@ if __name__ == '__main__':
     trainer.train()
     print("Training finished.")
 
-    # ---------- generate larger batch and run UCFilter as before ----------
+    # ---------- generate larger batch (optionally conditional on RPM) and run UCFilter ----------
     print("Generating bulk samples and running UCFilter...")
+
     # 根据是否有条件决定采样方式
     if COND_DIM > 0:
-        # 如果有条件，使用随机条件或从数据集中采样条件
-        print("Note: Conditional generation is enabled, but using unconditional sampling for UCFilter")
-        sampled_seqs = diffusion.sample(batch_size=64)
+        # 有条件模型：显式指定目标 RPM（例如 2000 RPM）
+        TARGET_RPM = 2000.0
+        # 与数据集中的归一化方式保持一致：norm_rpm = (rpm - 1000) / 2000
+        target_norm_rpm = (TARGET_RPM - 1000.0) / 2000.0
+
+        print(f"Conditional generation enabled. Target RPM = {TARGET_RPM} (norm = {target_norm_rpm:.4f})")
+
+        # 构造条件批次张量 (batch, cond_dim)
+        batch_size = 64
+        cond_batch = torch.full(
+            (batch_size, COND_DIM),
+            fill_value=target_norm_rpm,
+            dtype=torch.float32,
+            device=device,
+        )
+
+        # 优先使用 Trainer1D 的 EMA 条件采样接口
+        try:
+            print("Sampling with Trainer1D.sample_with_condition (EMA model)...")
+            sampled_seqs = trainer.sample_with_condition(
+                batch_size=batch_size,
+                cond=cond_batch,
+            )
+            if sampled_seqs is None:
+                raise RuntimeError("trainer.sample_with_condition returned None")
+        except Exception as e:
+            print(f"Trainer1D.sample_with_condition failed, fallback to diffusion.sample with cond. Error: {e}")
+            sampled_seqs = diffusion.sample(
+                batch_size=batch_size,
+                model_forward_kwargs={"cond": cond_batch},
+            )
     else:
+        # 无条件模型：保持原有无条件采样
         sampled_seqs = diffusion.sample(batch_size=64)
     sampled_seqs_np = sampled_seqs.squeeze(1).cpu().numpy()
 

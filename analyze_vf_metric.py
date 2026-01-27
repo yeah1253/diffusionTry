@@ -13,7 +13,7 @@ from scipy.signal import find_peaks
 REAL_DATA_PATH = r'D:\山东科技大学轴承齿轮数据集\轴承数据集\NC\NC 2000 0.mat'
 REAL_SIGNAL_NAME = 'Bearing_Acc_X'
 GENERATED_DIR = './generated_samples'
-FS = 5000  # Hz
+FS = 25600  # Hz
 START_IDX = 1000 # 确保从稳态区域开始取样 (5000之后)
 END_IDX = 5000
 NUM_PEAKS = 10  # 提取的主要频率峰值数量
