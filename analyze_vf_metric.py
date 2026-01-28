@@ -16,7 +16,7 @@ GENERATED_DIR = './generated_samples'
 FS = 25600  # Hz
 START_IDX = 1000 # 确保从稳态区域开始取样 (5000之后)
 END_IDX = 5000
-NUM_PEAKS = 10  # 提取的主要频率峰值数量
+NUM_PEAKS = 100  # 提取的主要频率峰值数量
 FFT_SIZE_MULTIPLIER = 4  # FFT零填充倍数，增加频率分辨率（推荐4-16）
 
 # 辅助函数：从结构体中提取最大的向量
@@ -398,7 +398,7 @@ if __name__ == '__main__':
         ax6.grid(True, alpha=0.3, axis='y')
     
     plt.tight_layout()
-    output_path = './vf_analysis.png'
+    output_path = './vf_analysis10000.png'
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
     print(f'可视化图表已保存到: {output_path}')
     plt.show()
