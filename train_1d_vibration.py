@@ -216,7 +216,7 @@ if __name__ == '__main__':
 
     # ---------- dataset configuration (real SDUST data) ----------
     SEQ_LENGTH = 1024
-    DATA_PATH = r'D:\山东科技大学轴承齿轮数据集\轴承数据集\speed'
+    DATA_PATH = r'D:\speedLoad'
     OVERLAP = 0.5  # 滑动窗口重叠比例
     USE_CONDITION = True  # 是否使用条件（从文件名提取 RPM），False 表示无条件生成
 
@@ -235,11 +235,13 @@ if __name__ == '__main__':
 
     print(f"Building PhysiNet (cond_dim={COND_DIM})...")
     model = PhysiNet(
-        dim = 64,
-        dim_mults = (1, 2, 4, 8),
+        dim = 128,                    # 增加基础维度 (64 -> 128) 以提升模型容量
+        dim_mults = (1, 2, 4, 8),     # 保持4层深度结构
         channels = CHANNELS,
         cond_dim = COND_DIM,
-        dropout = 0.0,
+        dropout = 0.1,                # 增加 dropout (0.0 -> 0.1) 防止过拟合
+        attn_dim_head = 64,           # 增加注意力头维度 (32 -> 64)
+        attn_heads = 8,               # 增加注意力头数 (4 -> 8)
     )
 
     diffusion = GaussianDiffusion1D(
@@ -250,17 +252,19 @@ if __name__ == '__main__':
         auto_normalize = False,
     )
 
-    # ---------- trainer (small default steps for quick verification) ----------
+    # ---------- trainer (adjusted for 23 files with RPM+Load conditions) ----------
+    # 数据量估算: 23个文件 × ~1000样本/文件 ≈ 23000样本
+    # 有效batch: 48 × 2 = 96, 每epoch约240步, 30000步约125个epoch
     trainer = Trainer1D(
         diffusion,
         dataset = dataset,
-        train_batch_size = 32,
-        train_lr = 8e-5,
-        train_num_steps = 10000,        # demo default; increase for full training
-        gradient_accumulate_every = 1,
-        ema_decay = 0.995,
-        amp = False,                  # disable AMP for small demo stability
-        save_and_sample_every = 1000,
+        train_batch_size = 48,        # 调整为48，避免显存不足 (dim=128模型更大)
+        train_lr = 4e-5,              # 降低学习率提升训练稳定性
+        train_num_steps = 30000,      # 约125个epoch，足够收敛
+        gradient_accumulate_every = 2, # 梯度累积，有效batch=96
+        ema_decay = 0.9995,           # 较高的EMA衰减率
+        amp = True,                   # 启用AMP加速训练
+        save_and_sample_every = 1500, # 每1500步保存一次，共20个checkpoint
         num_samples = 16,
         results_folder = './results_vibration',
     )
@@ -276,7 +280,7 @@ if __name__ == '__main__':
     if COND_DIM > 0:
         # 有条件模型：显式指定目标 RPM 和 Load
         TARGET_RPM = 2000.0
-        TARGET_LOAD = 20.0  # 可以修改为其他负载值，如 0, 20, 40, 60
+        TARGET_LOAD = 40.0  # 可以修改为其他负载值，如 0, 20, 40, 60
         
         # 与数据集中的归一化方式保持一致
         target_norm_rpm = (TARGET_RPM - 1000.0) / 2000.0

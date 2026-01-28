@@ -10,7 +10,7 @@ from scipy.fft import fft
 from scipy.signal import find_peaks
 
 # ===== 配置参数 =====
-REAL_DATA_PATH = r'D:\山东科技大学轴承齿轮数据集\轴承数据集\NC\NC 2000 0.mat'
+REAL_DATA_PATH = r'D:\NC 2000 40.mat'
 REAL_SIGNAL_NAME = 'Bearing_Acc_X'
 GENERATED_DIR = './generated_samples'
 FS = 25600  # Hz
