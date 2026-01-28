@@ -225,7 +225,7 @@ def visualize_comparison(real_signal, gen_signals, indices, real_stats, gen_stat
     base_fft_size = 2 ** int(np.ceil(np.log2(signal_len)))
     N = base_fft_size * 4
     Y_real = fft(real_signal, N)
-    fs = 5000  # 采样频率
+    fs = 25600  # 采样频率
     f_vec = fs * np.arange(N // 2 + 1) / N
     P_real = np.abs(Y_real[:N // 2 + 1]) / signal_len
     P_real[0] = 0
@@ -336,7 +336,7 @@ if __name__ == '__main__':
     # 分析
     real_stats, gen_stats, ratios = analyze_amplitude_statistics(real_signal, gen_signals)
     peak_freqs, peak_mags_real, gen_peak_mags = analyze_frequency_amplitude(
-        real_signal, gen_signals, fs=5000
+        real_signal, gen_signals, fs=25600
     )
     
     # 可视化

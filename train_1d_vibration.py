@@ -29,7 +29,7 @@ class RealSDUSTDataset(torch.utils.data.Dataset):
     - data_path: .mat 文件所在目录
     - seq_length: 每个样本的序列长度
     - overlap: 滑动窗口的重叠比例 (0-1)
-    - use_condition: 是否使用条件（从文件名提取 RPM），如果 False 则 cond_dim=0
+    - use_condition: 是否使用条件（从文件名提取 RPM 和 Load），如果 False 则 cond_dim=0
     """
     def __init__(self, data_path, seq_length=1024, overlap=0.5, use_condition=False):
         super().__init__()
@@ -56,27 +56,36 @@ class RealSDUSTDataset(torch.utils.data.Dataset):
                 # 提取 y_values 的第一列
                 signal = data['Signal']['y_values'][0, 0]['values'].item()[:, 0]
                 
-                # 从文件名提取 RPM（如果启用条件）
+                # 从文件名提取 RPM 和 Load（如果启用条件）
+                # 文件名格式: "NC 1800 0.mat" -> RPM=1800, Load=0
                 rpm = None
+                load = None
                 if self.use_condition:
-                    # 尝试从文件名提取数字（如 "NC 1000 0.mat" -> 1000）
-                    match = re.search(r'(\d+)', os.path.basename(mat_file))
-                    if match:
-                        rpm = float(match.group(1))
+                    # 提取文件名中的所有数字
+                    numbers = re.findall(r'(\d+)', os.path.basename(mat_file))
+                    if len(numbers) >= 2:
+                        rpm = float(numbers[0])   # 第一个数字是 RPM
+                        load = float(numbers[1])  # 第二个数字是 Load
+                    elif len(numbers) == 1:
+                        rpm = float(numbers[0])
+                        load = 0.0  # 默认负载为 0
                     else:
-                        rpm = 2000.0  # 默认值
+                        rpm = 2000.0  # 默认 RPM
+                        load = 0.0    # 默认负载
                 
                 # 将长序列分割成多个样本
                 samples = create_samples(signal, self.seq_length, self.overlap)
                 
                 for sample in samples:
                     all_signals.append(sample.astype(np.float32))
-                    if self.use_condition and rpm is not None:
+                    if self.use_condition and rpm is not None and load is not None:
                         # 归一化 RPM: 假设范围 1000-3000
                         norm_rpm = (rpm - 1000.0) / 2000.0
-                        all_conditions.append(np.array([norm_rpm], dtype=np.float32))
+                        # 归一化 Load: 假设范围 0-60
+                        norm_load = load / 60.0
+                        all_conditions.append(np.array([norm_rpm, norm_load], dtype=np.float32))
                 
-                print(f"  Extracted {len(samples)} samples from {len(signal)} data points")
+                print(f"  Extracted {len(samples)} samples from {len(signal)} data points (RPM={rpm}, Load={load})")
                 
             except Exception as e:
                 print(f"  Warning: Failed to load {mat_file}: {e}")
@@ -99,14 +108,14 @@ class RealSDUSTDataset(torch.utils.data.Dataset):
         
         # 条件信息
         if self.use_condition and len(all_conditions) > 0:
-            self.conditions = np.stack(all_conditions, axis=0)  # (N, 1)
-            self.cond_dim = 1
+            self.conditions = np.stack(all_conditions, axis=0)  # (N, 2) - [RPM, Load]
+            self.cond_dim = 2
         else:
             self.conditions = None
             self.cond_dim = 0
         
         print(f"Total dataset size: {len(self.signals)} samples")
-        print(f"Condition dimension: {self.cond_dim}")
+        print(f"Condition dimension: {self.cond_dim} (RPM, Load)")
     
     def __len__(self):
         return len(self.signals)
@@ -265,21 +274,33 @@ if __name__ == '__main__':
 
     # 根据是否有条件决定采样方式
     if COND_DIM > 0:
-        # 有条件模型：显式指定目标 RPM（例如 2000 RPM）
+        # 有条件模型：显式指定目标 RPM 和 Load
         TARGET_RPM = 2000.0
-        # 与数据集中的归一化方式保持一致：norm_rpm = (rpm - 1000) / 2000
+        TARGET_LOAD = 20.0  # 可以修改为其他负载值，如 0, 20, 40, 60
+        
+        # 与数据集中的归一化方式保持一致
         target_norm_rpm = (TARGET_RPM - 1000.0) / 2000.0
+        target_norm_load = TARGET_LOAD / 60.0
 
-        print(f"Conditional generation enabled. Target RPM = {TARGET_RPM} (norm = {target_norm_rpm:.4f})")
+        print(f"Conditional generation enabled. Target RPM = {TARGET_RPM} (norm = {target_norm_rpm:.4f}), Load = {TARGET_LOAD} (norm = {target_norm_load:.4f})")
 
         # 构造条件批次张量 (batch, cond_dim)
         batch_size = 64
-        cond_batch = torch.full(
-            (batch_size, COND_DIM),
-            fill_value=target_norm_rpm,
-            dtype=torch.float32,
-            device=device,
-        )
+        if COND_DIM == 2:
+            # 两个条件：RPM 和 Load
+            cond_batch = torch.tensor(
+                [[target_norm_rpm, target_norm_load]] * batch_size,
+                dtype=torch.float32,
+                device=device,
+            )
+        else:
+            # 单个条件：RPM（向后兼容）
+            cond_batch = torch.full(
+                (batch_size, COND_DIM),
+                fill_value=target_norm_rpm,
+                dtype=torch.float32,
+                device=device,
+            )
 
         # 优先使用 Trainer1D 的 EMA 条件采样接口
         try:
