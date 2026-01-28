@@ -267,6 +267,9 @@ if __name__ == '__main__':
         save_and_sample_every = 1500, # 每1500步保存一次，共20个checkpoint
         num_samples = 16,
         results_folder = './results_vibration',
+        # 传入归一化参数，会保存到检查点中供推理时使用
+        denorm_min = dataset.signal_min,
+        denorm_max = dataset.signal_max,
     )
 
     print("Starting training on real SDUST dataset...")

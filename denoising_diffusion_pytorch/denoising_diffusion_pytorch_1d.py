@@ -1447,7 +1447,12 @@ class Trainer1D(object):
             'opt': self.opt.state_dict(),
             'ema': self.ema.state_dict(),
             'scaler': self.accelerator.scaler.state_dict() if exists(self.accelerator.scaler) else None,
-            'version': __version__
+            'version': __version__,
+            # 保存归一化参数，用于推理时反归一化
+            'normalization_params': {
+                'signal_min': self.denorm_min,
+                'signal_max': self.denorm_max,
+            }
         }
 
         torch.save(data, str(self.results_folder / f'model-{milestone}.pt'))

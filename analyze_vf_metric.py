@@ -12,7 +12,7 @@ from scipy.signal import find_peaks
 # ===== 配置参数 =====
 REAL_DATA_PATH = r'D:\NC 2000 40.mat'
 REAL_SIGNAL_NAME = 'Bearing_Acc_X'
-GENERATED_DIR = './generated_samples'
+GENERATED_DIR = './generated_samples_infer'
 FS = 25600  # Hz
 START_IDX = 1000 # 确保从稳态区域开始取样 (5000之后)
 END_IDX = 5000
@@ -247,7 +247,7 @@ if __name__ == '__main__':
     generated_indices = []
     
     for i in range(9):
-        file_path = os.path.join(GENERATED_DIR, f'generated_signal_{i}.npy')
+        file_path = os.path.join(GENERATED_DIR, f'infer_signal_{i}.npy')
         if os.path.exists(file_path):
             signal = np.load(file_path).astype(np.float64)
             generated_signals.append(signal)
