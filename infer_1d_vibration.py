@@ -34,16 +34,22 @@ def find_latest_checkpoint(results_folder: str) -> str:
     return paths[-1]
 
 
-def build_model_and_diffusion(seq_length: int, channels: int) -> GaussianDiffusion1D:
+def build_model_and_diffusion(seq_length: int, channels: int, cond_dim: int = 2) -> GaussianDiffusion1D:
     """
     构建与训练阶段一致的 PhysiNet + GaussianDiffusion1D 结构。
     需要与 train_1d_vibration.py 中的配置保持完全一致。
+    
+    参数:
+    - seq_length: 序列长度
+    - channels: 通道数
+    - cond_dim: 条件维度，2 表示 RPM 和 Load，0 表示无条件生成
     """
     model = PhysiNet(
         dim=64,
         dim_mults=(1, 2, 4, 8),
         channels=channels,
-        cond_dim=0,  # 目前仍然是无条件生成
+        cond_dim=cond_dim,  # 支持条件生成：RPM 和 Load
+        dropout=0.0,
     )
 
     diffusion = GaussianDiffusion1D(
@@ -75,28 +81,53 @@ def load_trained_diffusion_from_checkpoint(
     return diffusion
 
 
-def compute_signal_min_max(mat_file_path: str, cutoff_points: int = 5000) -> tuple[float, float]:
+def load_normalization_params_from_checkpoint(ckpt_path: str) -> tuple[float, float]:
     """
-    复用训练脚本的数据预处理逻辑，计算原始振动信号的全局 min / max，
+    尝试从检查点文件中加载归一化参数。
+    如果检查点中没有保存，则返回 None。
+    """
+    try:
+        data = torch.load(ckpt_path, map_location='cpu', weights_only=True)
+        if 'normalization_params' in data:
+            params = data['normalization_params']
+            return params.get('signal_min'), params.get('signal_max')
+    except Exception as e:
+        print(f"Warning: Could not load normalization params from checkpoint: {e}")
+    return None, None
+
+
+def compute_signal_min_max_from_dataset(data_path: str) -> tuple[float, float]:
+    """
+    从训练数据集路径加载数据，计算原始振动信号的全局 min / max，
     以便对生成样本做反归一化，使频谱分析与训练阶段保持一致。
+    
+    参数:
+    - data_path: 训练数据集的路径（包含 .mat 文件的目录）
     """
-    mat_data = loadmat(mat_file_path)
-    bearing_acc_x = mat_data["Bearing_Acc_X"]
-
-    if bearing_acc_x.shape[0] == 1:
-        signal = bearing_acc_x[0]
-    else:
-        signal = bearing_acc_x.flatten()
-
-    if len(signal) > cutoff_points:
-        signal = signal[cutoff_points:]
-    else:
-        raise ValueError(
-            f"Signal length ({len(signal)}) is shorter than cutoff points ({cutoff_points})!"
-        )
-
-    signal_min = float(signal.min())
-    signal_max = float(signal.max())
+    
+    mat_files = glob.glob(os.path.join(data_path, '*.mat'))
+    if len(mat_files) == 0:
+        raise ValueError(f"No .mat files found in {data_path}")
+    
+    all_signals = []
+    for mat_file in sorted(mat_files):
+        try:
+            data = loadmat(mat_file)
+            # 提取 y_values 的第一列（与训练代码一致）
+            signal = data['Signal']['y_values'][0, 0]['values'].item()[:, 0]
+            all_signals.append(signal)
+        except Exception as e:
+            print(f"Warning: Failed to load {mat_file}: {e}")
+            continue
+    
+    if len(all_signals) == 0:
+        raise ValueError("No valid signals loaded from .mat files")
+    
+    # 计算全局 min/max
+    all_signals_array = np.concatenate(all_signals)
+    signal_min = float(all_signals_array.min())
+    signal_max = float(all_signals_array.max())
+    
     return signal_min, signal_max
 
 
@@ -104,9 +135,14 @@ def main():
     # 与训练脚本保持一致的超参数和数据路径
     SEQ_LENGTH = 1024
     CHANNELS = 1
+    COND_DIM = 2  # RPM 和 Load 两个条件
     RESULTS_FOLDER = "./results_vibration"
-    MAT_FILE_PATH = r"D:\haoran\数据集\simple_bearing\simple_bearing\ball\9005k.mat"
-    CUTOFF_POINTS = 5000
+    # 训练数据集路径，用于获取归一化参数（如果检查点中没有保存）
+    TRAIN_DATA_PATH = r'D:\山东科技大学轴承齿轮数据集\轴承数据集\speed'
+    
+    # 条件生成的目标值（可以修改）
+    TARGET_RPM = 2000.0
+    TARGET_LOAD = 20.0  # 可选值: 0, 20, 40, 60
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device for inference: {device}")
@@ -115,28 +151,50 @@ def main():
     ckpt_path = find_latest_checkpoint(RESULTS_FOLDER)
     print(f"Loading checkpoint: {ckpt_path}")
 
-    # 2) 构建模型与扩散对象
-    diffusion = build_model_and_diffusion(SEQ_LENGTH, CHANNELS)
+    # 2) 构建模型与扩散对象（支持条件生成）
+    diffusion = build_model_and_diffusion(SEQ_LENGTH, CHANNELS, cond_dim=COND_DIM)
     diffusion.to(device)
 
     # 3) 加载训练好的扩散模型权重（不重新训练）
     diffusion = load_trained_diffusion_from_checkpoint(ckpt_path, diffusion)
 
-    # 4) 计算原始信号的 min/max，用于反归一化
-    signal_min, signal_max = compute_signal_min_max(MAT_FILE_PATH, cutoff_points=CUTOFF_POINTS)
-    print(f"Loaded signal stats: min={signal_min:.4f}, max={signal_max:.4f}")
+    # 4) 获取归一化参数，用于反归一化
+    # 首先尝试从检查点加载，如果失败则从训练数据集计算
+    signal_min, signal_max = load_normalization_params_from_checkpoint(ckpt_path)
+    if signal_min is None or signal_max is None:
+        print("Normalization params not found in checkpoint, computing from training dataset...")
+        signal_min, signal_max = compute_signal_min_max_from_dataset(TRAIN_DATA_PATH)
+    print(f"Signal normalization params: min={signal_min:.4f}, max={signal_max:.4f}")
 
-    # 5) 使用训练好的扩散模型进行采样生成信号
+    # 5) 使用训练好的扩散模型进行条件采样生成信号
     num_samples = 64
     print(f"Sampling {num_samples} sequences from trained diffusion model...")
+    print(f"Conditional generation: RPM={TARGET_RPM}, Load={TARGET_LOAD}")
+    
+    # 归一化条件（与训练代码一致）
+    target_norm_rpm = (TARGET_RPM - 1000.0) / 2000.0
+    target_norm_load = TARGET_LOAD / 60.0
+    
+    # 构造条件批次张量 (batch, cond_dim)
+    cond_batch = torch.tensor(
+        [[target_norm_rpm, target_norm_load]] * num_samples,
+        dtype=torch.float32,
+        device=device,
+    )
+    print(f"Normalized conditions: RPM={target_norm_rpm:.4f}, Load={target_norm_load:.4f}")
 
     with torch.no_grad():
-        sampled = diffusion.sample(batch_size=num_samples)  # (N, C, L)
+        # 条件采样
+        sampled = diffusion.sample(
+            batch_size=num_samples,
+            model_forward_kwargs={"cond": cond_batch}
+        )  # (N, C, L)
 
     # 保存原始生成样本（反归一化）到 generated_samples_infer_raw
     sampled_np = sampled.squeeze(1).cpu().numpy()  # (N, L)
-    # denormalize from [-1, 1] back to original physical range
-    sampled_denorm = (sampled_np + 1.0) * 0.5 * (signal_max - signal_min) + signal_min
+    # 反归一化公式：x_original = (x_norm + 1) / 2 * (max - min) + min
+    signal_range = signal_max - signal_min + 1e-8
+    sampled_denorm = (sampled_np + 1.0) / 2.0 * signal_range + signal_min
 
     raw_folder = './generated_samples_infer_raw'
     os.makedirs(raw_folder, exist_ok=True)
