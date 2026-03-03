@@ -446,7 +446,7 @@ class UFourierLayer(Module):
         # 利用时间嵌入（已经包含 WCE 信息）生成通道尺度因子，近似 Q,K,V 的调制效果
         self.time_to_scale = nn.Linear(time_dim, channels)
 
-    def forward(self, x: Tensor, time_emb: Tensor) -> Tensor:
+    def forward(self, x: Tensor, time_emb: Tensor) -> Tensor: #利用傅里叶变换在频域提取最显著的故障频率特征
         """
         输入
         - x: (B, C, L) 时间域特征 x_t 或其 lifted 表示；
@@ -457,11 +457,11 @@ class UFourierLayer(Module):
         """
         b, c, n = x.shape
 
-        # ① 使用时间 / 条件嵌入进行通道重标定，近似 Attention(Q,K,V) 中的调制
+        # ① 使用时间 / 条件嵌入进行通道重标定，近似 Attention(Q,K,V) 中的调制(figure4中左上角的Transformer部分)
         # 为避免在 AMP 下产生 ComplexHalf（部分算子未实现），这里全部在 float32 / complex64 上完成 FFT 相关计算
         scale = self.time_to_scale(time_emb.float()).view(b, c, 1)  # (B, C, 1), float32
-        x_mod = x.float() * (1.0 + torch.tanh(scale))               # 调制后的 x_t，float32
-
+        x_mod = x.float() * (1.0 + torch.tanh(scale))               # 调制后的 x_t，float32(生成包含噪音，工况和时间步的融合特征)
+        #②到⑤:傅里叶变换与逆变换，提取主要频率特征
         # ② FFT 到频域（在 float32 上运行，得到 complex64）
         x_fft = torch.fft.rfft(x_mod, dim=-1)                       # (B, C, N_fft), complex64
         amp = x_fft.abs()                                           # 幅值 |F(x)|
@@ -627,7 +627,7 @@ class PhysiNet(Module):
         - x_self_cond: 自条件（与 `Unet1D` 一致，默认关闭）。
         """
         # 1) 时间嵌入
-        t = self.time_mlp(time)
+        t = self.time_mlp(time) # 经过傅里叶位置编码和全连接层提取出时间特征
 
         # 2) 条件嵌入（WCE）：在时间嵌入空间中调制，而不是简单拼通道
         if self.cond_dim > 0 and cond is not None and exists(self.cond_mlp):
@@ -641,7 +641,7 @@ class PhysiNet(Module):
                 raise ValueError(f"cond must have shape (B, cond_dim) or (B, cond_dim, L), got {tuple(cond.shape)}")
 
             cond_emb = self.cond_mlp(cond_vec)       # (B, time_dim)
-            t = t + cond_emb                         # WCE 约束噪声预测过程（Conditional Embedding）
+            t = t + cond_emb                         # WCE 时间编码与条件编码进行融合，即figure4中左上角的黄、绿线输入
 
         if self.self_condition:
             x_self_cond = default(x_self_cond, lambda: torch.zeros_like(x))
@@ -651,7 +651,7 @@ class PhysiNet(Module):
         v0 = self.init_conv(x)                       # (B, C_lift, L)
 
         # 4) U-Fourier Layer：得到物理驱动故障分量 P_{i,t}(x)
-        p_it = self.u_fourier(v0, t)                 # (B, C_lift, L)
+        p_it = self.u_fourier(v0, t)                 # (B, C_lift, L)经过傅里叶层处理后得到的主要特征
 
         # 5) U-Net：在残差 v0(x) - P_{i,t}(x) 上建模域特征 D_{i,t}(x)
         x_u = v0 - p_it
@@ -1286,7 +1286,7 @@ class GaussianDiffusion1D(Module):
         # this technique will slow down training by 25%, but seems to lower FID significantly
 
         x_self_cond = None
-        if self.self_condition and random() < 0.5:
+        if self.self_condition and random() < 0.5:  #自条件预测(提升模型的预测能力)
             with torch.no_grad():
                 x_self_cond = self.model_predictions(x, t).pred_x_start
                 x_self_cond.detach_()
@@ -1298,7 +1298,7 @@ class GaussianDiffusion1D(Module):
         # predict and take gradient step
 
         # filter model_forward_kwargs similarly before calling the model
-        try:
+        try:  #防止参数错误传递
             sig = inspect.signature(self.model.forward)
             accepts_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
             if not accepts_var_kw:
@@ -1308,14 +1308,14 @@ class GaussianDiffusion1D(Module):
             pass
 
         model_out = self.model(x, t, **model_forward_kwargs)
-
+        #训练过程预测不同目标
         if self.objective == 'pred_noise':
-            target = noise
+            target = noise #预测纯噪音
         elif self.objective == 'pred_x0':
-            target = x_start
+            target = x_start #预测干净的信号
         elif self.objective == 'pred_v':
             v = self.predict_v(x_start, t, noise)
-            target = v
+            target = v  #预测 v 参数（速度参数）
         else:
             raise ValueError(f'unknown objective {self.objective}')
 
@@ -1339,6 +1339,7 @@ class GaussianDiffusion1D(Module):
         img = self.normalize(img)
 
         # Extract optional condition and model_forward_kwargs, merge and pass into p_losses
+        #条件参数传递逻辑:将cond传递给更底层的PhysiNet网络
         cond = kwargs.pop('cond', None)
         model_forward_kwargs = kwargs.pop('model_forward_kwargs', {})
         if cond is not None:
@@ -1484,12 +1485,12 @@ class Trainer1D(object):
         with tqdm(initial = self.step, total = self.train_num_steps, disable = not accelerator.is_main_process) as pbar:
 
             while self.step < self.train_num_steps:
-                self.model.train()
+                self.model.train()  #调用它会将 self.model及其所有子模块的内部状态标志（training 属性）设置为 True
 
                 total_loss = 0.
 
-                for _ in range(self.gradient_accumulate_every): #gradient_accumulate_every是等效批，即等效批次 = batchsize * gradient_accumulate_every
-                    batch = next(self.dl)
+                for _ in range(self.gradient_accumulate_every): #gradient_accumulate_every是等效批，即等效批次 = batchsize * gradient_accumulate_every,即循环gradient_accumulate_every次之后再进行梯度更新
+                    batch = next(self.dl)  # 获取一个batch(48个样本)的数据
                     # dataloader may return (data, cond) or just data
                     if isinstance(batch, (list, tuple)) and len(batch) == 2:
                         data, cond = batch
@@ -1504,7 +1505,7 @@ class Trainer1D(object):
                     else:
                         cond = None
 
-                    with self.accelerator.autocast():
+                    with self.accelerator.autocast():  # 模型训练
                         # pass condition through the diffusion wrapper; GaussianDiffusion1D.forward will forward cond
                         loss = self.model(data, cond=cond)
                         loss = loss / self.gradient_accumulate_every

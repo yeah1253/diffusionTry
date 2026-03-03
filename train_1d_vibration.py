@@ -244,7 +244,7 @@ if __name__ == '__main__':
         attn_heads = 8,               # 增加注意力头数 (4 -> 8)
     )
 
-    diffusion = GaussianDiffusion1D(
+    diffusion = GaussianDiffusion1D(     #
         model,
         seq_length = SEQ_LENGTH,
         timesteps = 1000,

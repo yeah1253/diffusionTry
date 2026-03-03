@@ -23,3 +23,22 @@ t-sne降维图、判别器、下游故障诊断任务、VF
 3、（已完成）数据归一化到【0，1】会引入0.5的直流分量，尝试归一化到【-1，1】。是否额外加入去直流问题问gpt。
 需要归一化到-1，1；尝试后效果不错。
 4、每一个保存的模型都进行一次VF计算，并显示其VF的值，推理程序中用VF最小的程序。
+
+3.2 读代码并标注重要内容(以后写代码一定要将公式与原理图相结合)
+该代码是基于DiffPhysiNet.pdf进行优化的
+一、建立样本(数据预处理)
+1、train_1d_vibration.py  57行    只生成一个通道的振动信号，后续需要修改成三通道信号
+2、train_1d_vibration.py  65行    注意数据的命名格式(通过文件名获取负载和转速信息)
+3、train_1d_vibration.py  def create_samples   将长序列分割成多个样本(步长和单个样本长度)
+4、train_1d_vibration.py  98行     将多个一维数组堆叠为一个N*S的二维向量
+改进方向：1、加入获取工况的参数    2、110行修改cond_dim的获取(0/2)   3、81行 归一化问题(根据RPM和Load进行归一化而不是定值) 4、57行 只生成一个通道的振动信号，后续需要修改成三通道信号(channel)
+
+二、模型
+1、train_1d_vibration.py 619行  PhysiNet中的def forward   论文中figure4
+2、代码整体架构：Trainer1D(设置模型属性，提取一个batch数据送入特征提取网络，计算loss) --> GaussianDiffusion1D(向PhysiNet网络传递参数),def p_losses(添加噪声)  --> PhysiNet
+3、denoising_diffusion_pytorch_1d.py  1339行   重复归一化
+4、denoising_diffusion_pytorch_1d.py  1288行   自条件技巧(现在是False，可以改成True)
+5、denoising_diffusion_pytorch_1d.py  635行    现在cond只能有两个或三个条件，后续需要修改
+6、denoising_diffusion_pytorch_1d.py  470行    k = min(self.k_top, amp.shape[-1])中的self.k_top为挑选的最大频率个数
+7、denoising_diffusion_pytorch_1d.py  685行    figure 4 w部分画图有误
+
