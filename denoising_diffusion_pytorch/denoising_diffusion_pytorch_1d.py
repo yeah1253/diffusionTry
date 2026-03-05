@@ -428,26 +428,183 @@ class Unet1D(Module):
 
 class UFourierLayer(Module):
     """
-    U-Fourier Layer（简化实现），对应论文中 Figure 4 上半部分的
-    物理驱动 Fourier 分解模块 [file:///c%3A/Users/User/Documents/GitHub/diffusion_try/diffusionTry/DiffPhysiNet.pdf]。
+    U-Wavelet Layer（基于连续小波变换 CWT 的实现），对应论文中 Figure 4 上半部分的
+    物理驱动分解模块 [file:///c%3A/Users/User/Documents/GitHub/diffusion_try/diffusionTry/DiffPhysiNet.pdf]。
 
     主要功能：
-    - 对输入特征在时间维做 FFT；
-    - 依据频域幅值选取 Top-K 物理显著频率（式 (5)(6)）；
-    - 仅保留这些频率分量并做 IFFT 得到物理驱动故障分量 P_{i,t}(x)（式 (7)）；
+    - 对输入特征在时间维做连续小波变换（CWT）；
+    - 依据小波系数能量，使用累积能量占比法（Cumulative Energy Ratio）动态选取显著分量（式 (5)(6)）；
+    - 仅保留累积能量达到阈值的分量并做逆小波变换（ICWT）得到物理驱动故障分量 P_{i,t}(x)（式 (7)）；
     - 通过时间 / 条件嵌入产生的缩放向量，对输入进行调制，近似式 (4) 中基于 Timestep 和 WCE 的注意力。
     """
 
-    def __init__(self, channels: int, time_dim: int, k_top: int = 8):
+    def __init__(self, channels: int, time_dim: int, energy_threshold: float = 0.9,
+                 wavelet: str = 'morl', num_scales: int = 32):
+        """
+        参数
+        - channels: 输入特征通道数
+        - time_dim: 时间嵌入维度
+        - energy_threshold: 累积能量占比阈值，默认 0.9（保留 90% 能量的分量）
+        - wavelet: 小波基函数类型，默认 'morl'（Morlet 小波）
+        - num_scales: 小波变换的尺度数量，默认 32
+        """
         super().__init__()
         self.channels = channels
-        self.k_top = k_top
+        self.energy_threshold = energy_threshold
+        self.wavelet = wavelet
+        self.num_scales = num_scales
 
         # 利用时间嵌入（已经包含 WCE 信息）生成通道尺度因子，近似 Q,K,V 的调制效果
         self.time_to_scale = nn.Linear(time_dim, channels)
 
-    def forward(self, x: Tensor, time_emb: Tensor) -> Tensor: #利用傅里叶变换在频域提取最显著的故障频率特征
+        # 预计算 Morlet 小波滤波器（可微分实现）
+        # 注册为 buffer，不参与梯度计算但会随模型移动到正确设备
+        self._wavelet_filters = None
+        self._filter_length = None
+
+    def _get_morlet_wavelet(self, length: int, scales: Tensor, omega0: float = 6.0) -> Tensor:
         """
+        生成 Morlet 小波滤波器组（频域实现，支持 GPU 和自动微分）
+
+        参数
+        - length: 信号长度
+        - scales: 尺度参数张量 (num_scales,)
+        - omega0: Morlet 小波中心频率，默认 6.0
+
+        返回
+        - filters: (num_scales, length) 频域小波滤波器
+        """
+        device = scales.device
+        dtype = scales.dtype
+
+        # 频率轴（归一化频率）
+        freqs = torch.fft.rfftfreq(length, d=1.0, device=device).to(dtype)  # (length//2+1,)
+
+        # 对每个尺度生成频域 Morlet 小波
+        # Morlet 小波的频域表示: exp(-0.5 * (s * omega - omega0)^2)
+        scales_expanded = scales.view(-1, 1)  # (num_scales, 1)
+        freqs_expanded = freqs.view(1, -1) * 2 * math.pi * length  # (1, length//2+1)
+
+        # 计算频域 Morlet 小波
+        omega_scaled = scales_expanded * freqs_expanded  # (num_scales, length//2+1)
+        filters = torch.exp(-0.5 * (omega_scaled - omega0) ** 2)  # (num_scales, length//2+1)
+
+        # 归一化
+        filters = filters / (filters.sum(dim=-1, keepdim=True) + 1e-8)
+
+        return filters
+
+    def _cwt(self, x: Tensor) -> Tensor:
+        """
+        连续小波变换（CWT）的可微分实现
+
+        参数
+        - x: (B, C, L) 输入信号
+
+        返回
+        - coeffs: (B, C, num_scales, L) 小波系数
+        """
+        b, c, n = x.shape
+        device = x.device
+        dtype = x.dtype
+
+        # 生成尺度参数（对数间隔，覆盖不同频率范围）
+        scales = torch.logspace(0, math.log10(n / 4 + 1), self.num_scales, device=device, dtype=dtype)
+
+        # 获取频域小波滤波器
+        wavelet_filters = self._get_morlet_wavelet(n, scales)  # (num_scales, n//2+1)
+
+        # 对输入信号做 FFT
+        x_fft = torch.fft.rfft(x, dim=-1)  # (B, C, n//2+1)
+
+        # 在频域应用小波滤波器（卷积定理）
+        # x_fft: (B, C, n//2+1) -> (B, C, 1, n//2+1)
+        # wavelet_filters: (num_scales, n//2+1) -> (1, 1, num_scales, n//2+1)
+        x_fft_expanded = x_fft.unsqueeze(2)  # (B, C, 1, n//2+1)
+        filters_expanded = wavelet_filters.unsqueeze(0).unsqueeze(0)  # (1, 1, num_scales, n//2+1)
+
+        # 频域相乘
+        coeffs_fft = x_fft_expanded * filters_expanded  # (B, C, num_scales, n//2+1)
+
+        # IFFT 得到小波系数
+        coeffs = torch.fft.irfft(coeffs_fft, n=n, dim=-1)  # (B, C, num_scales, L)
+
+        return coeffs
+
+    def _icwt(self, coeffs: Tensor, mask: Tensor) -> Tensor:
+        """
+        逆连续小波变换（ICWT）的可微分实现
+
+        参数
+        - coeffs: (B, C, num_scales, L) 小波系数
+        - mask: (B, C, num_scales) 能量掩码，标记保留的尺度分量
+
+        返回
+        - reconstructed: (B, C, L) 重构信号
+        """
+        # 应用掩码到小波系数
+        # mask: (B, C, num_scales) -> (B, C, num_scales, 1)
+        mask_expanded = mask.unsqueeze(-1)  # (B, C, num_scales, 1)
+        masked_coeffs = coeffs * mask_expanded  # (B, C, num_scales, L)
+
+        # 沿尺度维度求和重构信号（简化的 ICWT）
+        # 使用加权求和，权重可以根据尺度调整
+        reconstructed = masked_coeffs.sum(dim=2)  # (B, C, L)
+
+        return reconstructed
+
+    def _compute_energy_mask(self, coeffs: Tensor) -> Tensor:
+        """
+        使用累积能量占比法计算掩码
+
+        参数
+        - coeffs: (B, C, num_scales, L) 小波系数
+
+        返回
+        - mask: (B, C, num_scales) 掩码张量，保留的分量为 1，其余为 0
+        """
+        b, c, num_scales, n = coeffs.shape
+
+        # 计算每个尺度的能量（沿时间维求和）
+        energy = (coeffs ** 2).sum(dim=-1)  # (B, C, num_scales)
+
+        # 对每个 (batch, channel) 独立处理
+        # 将能量降序排列
+        sorted_energy, sorted_idx = torch.sort(energy, dim=-1, descending=True)  # (B, C, num_scales)
+
+        # 计算总能量
+        total_energy = sorted_energy.sum(dim=-1, keepdim=True) + 1e-8  # (B, C, 1)
+
+        # 计算累积能量比例
+        cumsum_energy = torch.cumsum(sorted_energy, dim=-1)  # (B, C, num_scales)
+        cumsum_ratio = cumsum_energy / total_energy  # (B, C, num_scales)
+
+        # 找到累积能量首次达到阈值的位置
+        # 创建阈值掩码：cumsum_ratio <= threshold 的位置保留
+        # 但要确保至少保留一个分量，且在达到阈值后的第一个分量也保留
+        threshold_mask = cumsum_ratio <= self.energy_threshold  # (B, C, num_scales)
+
+        # 为了确保达到阈值，需要包含刚好超过阈值的那个分量
+        # 使用 roll 来实现：如果当前位置为 False 但前一个位置为 True，则当前位置也应该为 True
+        shifted_mask = torch.roll(threshold_mask, shifts=1, dims=-1)
+        shifted_mask[..., 0] = True  # 第一个位置始终保留
+
+        # 最终的排序空间掩码
+        sorted_mask = threshold_mask | (shifted_mask & ~threshold_mask)
+        # 确保至少保留第一个分量
+        sorted_mask[..., 0] = True
+
+        # 将掩码映射回原始尺度顺序
+        # 创建用于 scatter 的索引
+        mask = torch.zeros_like(energy)
+        mask.scatter_(-1, sorted_idx, sorted_mask.float())
+
+        return mask
+
+    def forward(self, x: Tensor, time_emb: Tensor) -> Tensor:
+        """
+        利用连续小波变换提取最显著的故障分量特征
+
         输入
         - x: (B, C, L) 时间域特征 x_t 或其 lifted 表示；
         - time_emb: (B, time_dim) 已融合 WCE 的时间步嵌入。
@@ -456,30 +613,24 @@ class UFourierLayer(Module):
         - p_it: (B, C, L) 物理驱动故障分量 P_{i,t}(x)。
         """
         b, c, n = x.shape
+        input_dtype = x.dtype
 
         # ① 使用时间 / 条件嵌入进行通道重标定，近似 Attention(Q,K,V) 中的调制(figure4中左上角的Transformer部分)
-        # 为避免在 AMP 下产生 ComplexHalf（部分算子未实现），这里全部在 float32 / complex64 上完成 FFT 相关计算
+        # 为避免在 AMP 下产生问题，这里全部在 float32 上完成计算
         scale = self.time_to_scale(time_emb.float()).view(b, c, 1)  # (B, C, 1), float32
         x_mod = x.float() * (1.0 + torch.tanh(scale))               # 调制后的 x_t，float32(生成包含噪音，工况和时间步的融合特征)
-        #②到⑤:傅里叶变换与逆变换，提取主要频率特征
-        # ② FFT 到频域（在 float32 上运行，得到 complex64）
-        x_fft = torch.fft.rfft(x_mod, dim=-1)                       # (B, C, N_fft), complex64
-        amp = x_fft.abs()                                           # 幅值 |F(x)|
 
-        # ③ 选取 Top-K 频率（式 (5)(6)），K 不超过频率长度
-        k = min(self.k_top, amp.shape[-1])
-        topk_vals, topk_idx = torch.topk(amp, k, dim=-1)            # (B, C, K)
+        # ② 连续小波变换（CWT）
+        coeffs = self._cwt(x_mod)  # (B, C, num_scales, L)
 
-        # ④ 构造只保留 Top-K 频率分量的频谱
-        masked_fft = torch.zeros_like(x_fft)
-        gathered = x_fft.gather(-1, topk_idx)
-        masked_fft.scatter_(-1, topk_idx, gathered)
+        # ③ 使用累积能量占比法计算掩码
+        mask = self._compute_energy_mask(coeffs)  # (B, C, num_scales)
 
-        # ⑤ IFFT 回到时间域，得到物理驱动故障分量 P_{i,t}(x)（式 (7)）
-        p_it = torch.fft.irfft(masked_fft, n=n, dim=-1)             # (B, C, N), float32
+        # ④ 逆小波变换（ICWT）重构物理驱动故障分量
+        p_it = self._icwt(coeffs, mask)  # (B, C, L)
 
         # 与输入实数张量保持同一 dtype（便于与 AMP / 其余网络兼容）
-        return p_it.to(x.dtype)
+        return p_it.to(input_dtype)
 
 
 class PhysiNet(Module):
@@ -572,7 +723,8 @@ class PhysiNet(Module):
         resnet_block = partial(ResnetBlock, time_emb_dim = time_dim, dropout = dropout)
 
         # U-Fourier Layer：在 lifted 特征空间上做物理分量抽取 P_{i,t}(x)
-        self.u_fourier = UFourierLayer(channels = init_dim, time_dim = time_dim, k_top = 8)
+        # 使用基于连续小波变换（CWT）和累积能量占比法的实现
+        self.u_fourier = UFourierLayer(channels = init_dim, time_dim = time_dim, energy_threshold = 0.9)
 
         # U-Net 结构（建模域特征 D_{i,t}(x)）
         self.downs = ModuleList([])
