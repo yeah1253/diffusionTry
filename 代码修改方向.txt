@@ -41,4 +41,5 @@ t-sne降维图、判别器、下游故障诊断任务、VF
 5、denoising_diffusion_pytorch_1d.py  635行    现在cond只能有两个或三个条件，后续需要修改
 6、denoising_diffusion_pytorch_1d.py  470行    k = min(self.k_top, amp.shape[-1])中的self.k_top为挑选的最大频率个数
 7、denoising_diffusion_pytorch_1d.py  685行    figure 4 w部分画图有误
+8、降维图 真实数据和生成数据的重合程度以及下游任务(简单网络的故障诊断)
 
