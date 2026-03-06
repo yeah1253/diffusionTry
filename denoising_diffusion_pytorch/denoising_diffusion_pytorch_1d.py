@@ -633,6 +633,33 @@ class UFourierLayer(Module):
         return p_it.to(input_dtype)
 
 
+class SinusoidalPositionalEncoding1D(Module):
+    """
+    1D 正弦位置编码（Sinusoidal Positional Encoding）。
+
+    为序列中的每个位置生成固定的正弦/余弦位置编码向量，
+    支持最大长度 max_len 的序列。不含可学习参数。
+
+    输入 : (B, L, D)
+    输出 : (B, L, D)  —— 叠加位置编码后的序列
+    """
+
+    def __init__(self, d_model: int, max_len: int = 2048):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, d_model, 2, dtype=torch.float32) * (-math.log(10000.0) / d_model)
+        )
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe.unsqueeze(0))  # (1, max_len, d_model)
+
+    def forward(self, x: Tensor) -> Tensor:
+        """x: (B, L, D) -> (B, L, D)"""
+        return x + self.pe[:, :x.size(1), :]
+
+
 class PhysiNet(Module):
     """
     基于 DiffPhysiNet 结构的一维 Physi-UNet（简化实现）。
@@ -641,8 +668,11 @@ class PhysiNet(Module):
     - U-Fourier Layer：利用 Top-K 频率做物理驱动分解，得到 P_{i,t}(x)；
     - U-Net：对残差 v0(x) - P_{i,t}(x) 建模，得到域特征 D_{i,t}(x)；
     - 通过 reweight & 激活，将物理分量与域特征融合得到 C_{i,t}(x)，再做投影得到 x_{t-1}。
-    条件编码（WCE）通过时间嵌入注入，与 Eq. (4)(8)(9)(10) 的思想保持一致
-    [file:///c%3A/Users/User/Documents/GitHub/diffusion_try/diffusionTry/DiffPhysiNet.pdf]。
+
+    条件注入采用"基于 Class Token 的异构条件联合嵌入网络"：
+    - 将工况条件映射为一个 Condition Token（Class Token），前置拼接到 lifted 特征序列；
+    - 经 Transformer 编码器自注意力运算，Class Token 自动吸附序列中关键的时频物理特征；
+    - 最终 Class Token 映射到 time_dim 后与时间嵌入相加，完成条件注入。
     """
 
     def __init__(
@@ -661,14 +691,18 @@ class PhysiNet(Module):
         learned_sinusoidal_dim = 16,
         sinusoidal_pos_emb_theta = 10000,
         attn_dim_head = 32,
-        attn_heads = 4
+        attn_heads = 4,
+        cond_transformer_layers: int = 2,
+        cond_transformer_heads: int = 4,
     ):
         """
         参数
         - dim, init_dim, out_dim, dim_mults, dropout, self_condition, ...:
           与 `Unet1D` 含义相同；
         - channels: 原始振动信号的通道数（通常为 1）；
-        - cond_dim: 条件向量维度（例如工况/物理参数个数），0 表示退化为无条件 U-Net。
+        - cond_dim: 条件向量维度（例如工况/物理参数个数），0 表示退化为无条件 U-Net；
+        - cond_transformer_layers: 条件 Transformer 编码器层数，默认 2；
+        - cond_transformer_heads: 条件 Transformer 编码器注意力头数，默认 4。
         """
         super().__init__()
 
@@ -677,20 +711,20 @@ class PhysiNet(Module):
         self.self_condition = self_condition
 
         # 这里保持与原始信号通道一致，条件信息不直接作为额外通道拼接
-        # 而是通过 WCE（Working Conditional Encoding）在“时间嵌入”空间中进行融合，
-        # 更贴近文中 “Physi-UNet 利用 WCE 进行噪声水平预测” 的描述 [file:///c%3A/Users/User/Documents/GitHub/diffusion_try/diffusionTry/DiffPhysiNet.pdf].
+        # 而是通过基于 Class Token 的异构条件联合嵌入网络在"时间嵌入"空间中进行融合。
         self.channels = channels
 
         input_channels = channels * (2 if self_condition else 1)
 
         init_dim = default(init_dim, dim)
+        self.init_dim = init_dim  # 保存以供 forward 使用
         self.init_conv = nn.Conv1d(input_channels, init_dim, 7, padding = 3)
 
         # 下采样(encoder)
         dims = [init_dim, *map(lambda m: dim * m, dim_mults)]
         in_out = list(zip(dims[:-1], dims[1:]))
 
-        # time embeddings（与 Unet1D 完全一致）
+        # time embeddings
         time_dim = dim * 4
 
         self.random_or_learned_sinusoidal_cond = learned_sinusoidal_cond or random_fourier_features
@@ -709,28 +743,48 @@ class PhysiNet(Module):
             nn.Linear(time_dim, time_dim)
         )
 
-        # 条件编码分支：将 WCE / 工况向量映射到与时间嵌入同一空间，
-        # 以便在噪声预测过程中对时间嵌入进行调制（physics-driven 条件约束）。
+        # ========== 基于 Class Token 的异构条件联合嵌入网络 ==========
         if self.cond_dim > 0:
-            self.cond_mlp = nn.Sequential(
-                nn.Linear(cond_dim, time_dim),
+            # (1) Condition Fusion MLP：将离散工况特征（RPM、Load 等）融合为
+            #     维度为 init_dim 的单一 Condition Token（Class Token）
+            self.cond_fusion_mlp = nn.Sequential(
+                nn.Linear(cond_dim, init_dim),
                 nn.GELU(),
-                nn.Linear(time_dim, time_dim)
+                nn.Linear(init_dim, init_dim),
             )
+
+            # (2) 1D 正弦位置编码（最大长度 2048，覆盖 L=1024 + 1 个 Class Token）
+            self.cond_pos_emb = SinusoidalPositionalEncoding1D(d_model=init_dim, max_len=2048)
+
+            # (3) Transformer 编码器：对 [Class Token; 特征序列] 做自注意力
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model=init_dim,
+                nhead=cond_transformer_heads,
+                dim_feedforward=init_dim * 4,
+                batch_first=True,
+                dropout=dropout,
+            )
+            self.cond_transformer = nn.TransformerEncoder(
+                encoder_layer,
+                num_layers=cond_transformer_layers,
+            )
+
+            # (4) 特征对齐层：将 Transformer 输出的 Class Token (init_dim) 映射到 time_dim
+            self.cls_to_time = nn.Linear(init_dim, time_dim)
         else:
-            self.cond_mlp = None
+            self.cond_fusion_mlp = None
+            self.cond_pos_emb = None
+            self.cond_transformer = None
+            self.cls_to_time = None
 
         resnet_block = partial(ResnetBlock, time_emb_dim = time_dim, dropout = dropout)
 
-        # U-Fourier Layer：在 lifted 特征空间上做物理分量抽取 P_{i,t}(x)
-        # 使用基于连续小波变换（CWT）和累积能量占比法的实现
-        self.u_fourier = UFourierLayer(channels = init_dim, time_dim = time_dim, energy_threshold = 0.9)
-
-        # U-Net 结构（建模域特征 D_{i,t}(x)）
+        # U-Net 结构
         self.downs = ModuleList([])
         self.ups = ModuleList([])
         num_resolutions = len(in_out)
 
+        # 下采样(encoder)
         for ind, (dim_in, dim_out) in enumerate(in_out):
             is_last = ind >= (num_resolutions - 1)
 
@@ -741,11 +795,13 @@ class PhysiNet(Module):
                 Downsample(dim_in, dim_out) if not is_last else nn.Conv1d(dim_in, dim_out, 3, padding = 1)
             ]))
 
+        # 中间层（标准 Attention 捕获全局依赖）
         mid_dim = dims[-1]
         self.mid_block1 = resnet_block(mid_dim, mid_dim)
         self.mid_attn = Residual(PreNorm(mid_dim, Attention(mid_dim, dim_head = attn_dim_head, heads = attn_heads)))
         self.mid_block2 = resnet_block(mid_dim, mid_dim)
 
+        # 上采样(decoder)
         for ind, (dim_in, dim_out) in enumerate(reversed(in_out)):
             is_last = ind == (len(in_out) - 1)
 
@@ -768,9 +824,13 @@ class PhysiNet(Module):
         # 投影层 Q(·)，将高维特征映射回 1D 振动信号空间（式 (10)）
         self.proj_Q = nn.Conv1d(init_dim, self.out_dim, 1)
 
+        # U-Fourier Layer：在 lifted 特征空间上做物理分量抽取 P_{i,t}(x)
+        # 使用基于连续小波变换（CWT）和累积能量占比法的实现
+        self.u_fourier = UFourierLayer(channels = init_dim, time_dim = time_dim, energy_threshold = 0.9)
+
     def forward(self, x, time, cond: Tensor = None, x_self_cond = None):
         """
-        条件去噪前向过程。
+        条件去噪前向过程（基于 Class Token 的异构条件联合嵌入）。
 
         输入
         - x: (B, C, L) 原始信号；
@@ -779,33 +839,55 @@ class PhysiNet(Module):
         - x_self_cond: 自条件（与 `Unet1D` 一致，默认关闭）。
         """
         # 1) 时间嵌入
-        t = self.time_mlp(time) # 经过傅里叶位置编码和全连接层提取出时间特征
+        t = self.time_mlp(time)  # (B, time_dim)
 
-        # 2) 条件嵌入（WCE）：在时间嵌入空间中调制，而不是简单拼通道
-        if self.cond_dim > 0 and cond is not None and exists(self.cond_mlp):
+        # 2) Self-condition 拼接（如果启用）
+        if self.self_condition:
+            x_self_cond = default(x_self_cond, lambda: torch.zeros_like(x))
+            x = torch.cat((x_self_cond, x), dim=1)
+
+        # 3) Lifting：将输入提前提升到高维特征 v0(x)（在条件嵌入之前完成）
+        v0 = self.init_conv(x)  # (B, init_dim, L)
+
+        # 4) 基于 Class Token 的异构条件联合嵌入
+        if self.cond_dim > 0 and cond is not None and exists(self.cond_fusion_mlp):
             # 兼容 (B, cond_dim) 或 (B, cond_dim, L) 的输入形状：
             if cond.dim() == 3:
-                # 沿时间维做平均池化，得到全局工况向量 (B, cond_dim)
-                cond_vec = cond.mean(dim = -1)
+                cond_vec = cond.mean(dim=-1)       # (B, cond_dim)
             elif cond.dim() == 2:
                 cond_vec = cond
             else:
-                raise ValueError(f"cond must have shape (B, cond_dim) or (B, cond_dim, L), got {tuple(cond.shape)}")
+                raise ValueError(
+                    f"cond must have shape (B, cond_dim) or (B, cond_dim, L), got {tuple(cond.shape)}"
+                )
 
-            cond_emb = self.cond_mlp(cond_vec)       # (B, time_dim)
-            t = t + cond_emb                         # WCE 时间编码与条件编码进行融合，即figure4中左上角的黄、绿线输入
+            # 第二步：生成 Class Token — 将工况条件映射为 init_dim 维的 Condition Token
+            z_cond = self.cond_fusion_mlp(cond_vec)   # (B, init_dim)
+            z_cond = z_cond.unsqueeze(1)               # (B, 1, init_dim)
 
-        if self.self_condition:
-            x_self_cond = default(x_self_cond, lambda: torch.zeros_like(x))
-            x = torch.cat((x_self_cond, x), dim = 1)
+            # 第三步：维度转换与级联拼接
+            v0_seq = v0.transpose(1, 2)                # (B, L, init_dim)
 
-        # 3) Lifting：将输入提升到高维特征 v0(x)
-        v0 = self.init_conv(x)                       # (B, C_lift, L)
+            # 将 Class Token 前置拼接到特征序列
+            x_joint = torch.cat([z_cond, v0_seq], dim=1)  # (B, L+1, init_dim)
 
-        # 4) U-Fourier Layer：得到物理驱动故障分量 P_{i,t}(x)
-        p_it = self.u_fourier(v0, t)                 # (B, C_lift, L)经过傅里叶层处理后得到的主要特征
+            # 第四步：添加位置编码并送入 Transformer 编码器做自注意力运算
+            # 在 float32 下运行 Transformer 以保持数值稳定性（AMP 兼容）
+            x_joint_f32 = x_joint.float()
+            x_joint_f32 = self.cond_pos_emb(x_joint_f32)       # (B, L+1, init_dim)
+            x_joint_f32 = self.cond_transformer(x_joint_f32)    # (B, L+1, init_dim)
 
-        # 5) U-Net：在残差 v0(x) - P_{i,t}(x) 上建模域特征 D_{i,t}(x)
+            # 第五步：提取更新后的 Class Token（第 0 个位置）
+            cls_token = x_joint_f32[:, 0, :]             # (B, init_dim)
+
+            # 第六步：映射到 time_dim 并注入时间嵌入
+            cond_emb = self.cls_to_time(cls_token)       # (B, time_dim)
+            t = t + cond_emb.to(t.dtype)                 # 条件注入
+
+        # 5) U-Fourier Layer：得到物理驱动故障分量 P_{i,t}(x)
+        p_it = self.u_fourier(v0, t)  # (B, init_dim, L)
+
+        # 6) U-Net：在残差 v0(x) - P_{i,t}(x) 上建模域特征 D_{i,t}(x)
         x_u = v0 - p_it
         h = []
 
@@ -824,20 +906,20 @@ class PhysiNet(Module):
         x_u = self.mid_block2(x_u, t)
 
         for block1, block2, attn, upsample in self.ups:
-            x_u = torch.cat((x_u, h.pop()), dim = 1)
+            x_u = torch.cat((x_u, h.pop()), dim=1)
             x_u = block1(x_u, t)
 
-            x_u = torch.cat((x_u, h.pop()), dim = 1)
+            x_u = torch.cat((x_u, h.pop()), dim=1)
             x_u = block2(x_u, t)
             x_u = attn(x_u)
 
             x_u = upsample(x_u)
 
-        # 6) 物理分量重加权并与域特征融合（式 (9)）
+        # 7) 物理分量重加权并与域特征融合（式 (9)）
         p_weighted = self.act_sigma1(self.reweight(p_it))
         c_it = self.act_sigma2(x_u + p_weighted)
 
-        # 7) 投影得到 x_{t-1}（式 (10)），与 DDPM-Backbone 接口兼容
+        # 8) 投影得到 x_{t-1}（式 (10)），与 DDPM-Backbone 接口兼容
         x_out = self.proj_Q(c_it)
         return x_out
 
