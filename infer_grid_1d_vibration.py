@@ -15,7 +15,7 @@ def find_latest_checkpoint(results_folder: str) -> str:
     """
     在给定目录中查找最新的 model-*.pt 权重文件。
     """
-    pattern = os.path.join(results_folder, "model-*.pt")
+    pattern = os.path.join(results_folder, "bear_digtal_model.pt")
     paths = glob.glob(pattern)
     if not paths:
         raise FileNotFoundError(f"No checkpoint files found in {results_folder}")
