@@ -828,6 +828,12 @@ class PhysiNet(Module):
         # 使用基于连续小波变换（CWT）和累积能量占比法的实现
         self.u_fourier = UFourierLayer(channels = init_dim, time_dim = time_dim, energy_threshold = 0.9)
 
+        # 工况回归头（TSTR 思路）：从全局池化特征预测条件向量
+        if self.cond_dim > 0:
+            self.cond_predictor = nn.Linear(init_dim, cond_dim)
+        else:
+            self.cond_predictor = None
+
     def forward(self, x, time, cond: Tensor = None, x_self_cond = None):
         """
         条件去噪前向过程（基于 Class Token 的异构条件联合嵌入）。
@@ -921,7 +927,15 @@ class PhysiNet(Module):
 
         # 8) 投影得到 x_{t-1}（式 (10)），与 DDPM-Backbone 接口兼容
         x_out = self.proj_Q(c_it)
-        return x_out
+
+        # 9) 工况回归分支（TSTR 思路）：对 c_it 全局平均池化后预测条件向量
+        if self.cond_predictor is not None:
+            global_feat = c_it.mean(dim=-1)          # (B, init_dim)
+            pred_cond = self.cond_predictor(global_feat)  # (B, cond_dim)
+        else:
+            pred_cond = None
+
+        return x_out, pred_cond
 
 # -----------------------------------------------------------------------------
 # gaussian diffusion trainer class
@@ -1199,6 +1213,52 @@ def ucfilter_kmeans_select_indices(
 
     return selected_indices, scores, labels
 
+
+def batch_kl_loss(real_x0: torch.Tensor, pred_x0: torch.Tensor, sigma: float = 1.0) -> torch.Tensor:
+    """
+    流形对齐散度损失（J-FTSD 思路）。
+
+    将真实 x0 和预测 x0（均为 3D 张量）展平为 2D，分别构建联合概率矩阵，
+    然后计算 KL(R_real || T_pred)。
+
+    参数
+    - real_x0 : (B, C, L)  真实 x0 张量（来自训练样本）；
+    - pred_x0 : (B, C, L)  模型预测的 x0 张量；
+    - sigma    : 高维 Gaussian 核带宽，默认 1.0。
+
+    返回
+    - kl_val  : 标量 Tensor，KL 散度之和。
+    """
+    eps = 1e-12
+
+    # 展平为 2D: (B, C*L)
+    b = real_x0.shape[0]
+    real_flat = real_x0.reshape(b, -1).float()
+    pred_flat = pred_x0.reshape(b, -1).float()
+
+    # ---- 构建 R_real：基于高斯核 ----
+    d2_real = torch.cdist(real_flat, real_flat, p=2) ** 2          # (B, B)
+    mask_od = ~torch.eye(b, dtype=torch.bool, device=real_x0.device)
+    p_cond_real = torch.exp(-d2_real / (2.0 * sigma ** 2))
+    p_cond_real = p_cond_real * mask_od
+    p_cond_real = p_cond_real / (p_cond_real.sum(dim=1, keepdim=True) + eps)
+    R_real = (p_cond_real + p_cond_real.t()) / (2.0 * b)
+    R_real = R_real * mask_od
+    # 归一化确保 R_real 是合法概率分布
+    R_real = R_real / (R_real.sum() + eps)
+
+    # ---- 构建 T_pred：基于 Student-t 分布 ----
+    d2_pred = torch.cdist(pred_flat, pred_flat, p=2) ** 2          # (B, B)
+    num_t = 1.0 / (1.0 + d2_pred)
+    num_t = num_t * mask_od
+    T_pred = num_t / (num_t.sum() + eps)
+    T_pred = T_pred * mask_od
+
+    # ---- KL(R_real || T_pred) ----
+    kl_val = (R_real * (torch.log(R_real + eps) - torch.log(T_pred + eps))).sum()
+    return kl_val
+
+
 class GaussianDiffusion1D(Module):
     def __init__(
         self,
@@ -1356,6 +1416,10 @@ class GaussianDiffusion1D(Module):
             pass
 
         model_output = self.model(x, t, **model_forward_kwargs)
+
+        # PhysiNet returns (signal_output, pred_cond) tuple; unwrap if so
+        if isinstance(model_output, tuple):
+            model_output, _ = model_output
 
         maybe_clip = partial(torch.clamp, min = -1., max = 1.) if clip_x_start else identity
 
@@ -1542,6 +1606,12 @@ class GaussianDiffusion1D(Module):
             pass
 
         model_out = self.model(x, t, **model_forward_kwargs)
+
+        # Unpack (signal_output, pred_cond) tuple returned by PhysiNet
+        pred_cond = None
+        if isinstance(model_out, tuple):
+            model_out, pred_cond = model_out
+
         #训练过程预测不同目标
         if self.objective == 'pred_noise':
             target = noise #预测纯噪音
@@ -1554,15 +1624,39 @@ class GaussianDiffusion1D(Module):
             raise ValueError(f'unknown objective {self.objective}')
 
         loss = F.mse_loss(model_out, target, reduction = 'none')
+        loss = reduce(loss, 'b ... -> b', 'mean')
+        loss = loss * extract(self.loss_weight, t, loss.shape)
+        loss_diff = loss  # 基础扩散 MSE 损失 (B,)
+
+        # ---- 工况回归损失 loss_reg（TSTR 思路） ----
+        loss_reg = torch.tensor(0.0, device=x_start.device)
+        if pred_cond is not None and 'cond' in model_forward_kwargs:
+            cond_target = model_forward_kwargs['cond']          # (B, cond_dim) 或 (B, cond_dim, L)
+            if cond_target.dim() == 3:
+                cond_target = cond_target.mean(dim=-1)          # -> (B, cond_dim)
+            loss_reg = F.mse_loss(pred_cond, cond_target.to(pred_cond.dtype))
+
+        # ---- 流形对齐散度损失 loss_kl（J-FTSD 思路） ----
+        with torch.no_grad():
+            # 从当前目标预测中还原 pred_x0
+            if self.objective == 'pred_noise':
+                pred_x0 = self.predict_start_from_noise(x, t, model_out.detach())
+            elif self.objective == 'pred_x0':
+                pred_x0 = model_out.detach()
+            elif self.objective == 'pred_v':
+                pred_x0 = self.predict_start_from_v(x, t, model_out.detach())
+            else:
+                pred_x0 = x_start
+        loss_kl = batch_kl_loss(x_start, pred_x0)
+
+        # ---- 融合损失 ----
+        total_loss = loss_diff.mean() + 0.1 * loss_reg + 0.01 * loss_kl
 
         if not return_reduced_loss:
-            return loss * extract(self.loss_weight, t, loss.shape)
+            # 仅在需要非缩减模式时返回原始 per-sample 损失（忽略辅助项）
+            return loss_diff
 
-        loss = reduce(loss, 'b ... -> b', 'mean')
-
-        loss = loss * extract(self.loss_weight, t, loss.shape)
-
-        return loss.mean()
+        return total_loss
 
     def forward(self, img, *args, **kwargs):
         b, n, device, seq_length, = img.shape[0], img.shape[self.seq_index], img.device, self.seq_length

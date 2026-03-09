@@ -12,7 +12,6 @@ from denoising_diffusion_pytorch.denoising_diffusion_pytorch_1d import (
     GaussianDiffusion1D,
     Trainer1D,
     Dataset1D,
-    ucfilter_kmeans_select_indices,
 )
 
 import matplotlib.pyplot as plt
@@ -276,15 +275,15 @@ if __name__ == '__main__':
     trainer.train()
     print("Training finished.")
 
-    # ---------- generate larger batch (optionally conditional on RPM) and run UCFilter ----------
-    print("Generating bulk samples and running UCFilter...")
+    # ---------- generate larger batch and save directly (no UCFilter clustering) ----------
+    print("Generating bulk samples...")
 
     # 根据是否有条件决定采样方式
     if COND_DIM > 0:
         # 有条件模型：显式指定目标 RPM 和 Load
         TARGET_RPM = 2000.0
         TARGET_LOAD = 40.0  # 可以修改为其他负载值，如 0, 20, 40, 60
-        
+
         # 与数据集中的归一化方式保持一致
         target_norm_rpm = (TARGET_RPM - 1000.0) / 2000.0
         target_norm_load = TARGET_LOAD / 60.0
@@ -294,14 +293,12 @@ if __name__ == '__main__':
         # 构造条件批次张量 (batch, cond_dim)
         batch_size = 64
         if COND_DIM == 2:
-            # 两个条件：RPM 和 Load
             cond_batch = torch.tensor(
                 [[target_norm_rpm, target_norm_load]] * batch_size,
                 dtype=torch.float32,
                 device=device,
             )
         else:
-            # 单个条件：RPM（向后兼容）
             cond_batch = torch.full(
                 (batch_size, COND_DIM),
                 fill_value=target_norm_rpm,
@@ -327,90 +324,69 @@ if __name__ == '__main__':
     else:
         # 无条件模型：保持原有无条件采样
         sampled_seqs = diffusion.sample(batch_size=64)
+
     sampled_seqs_np = sampled_seqs.squeeze(1).cpu().numpy()
 
+    # 保存原始生成样本
     raw_folder = './generated_samples_raw'
     os.makedirs(raw_folder, exist_ok=True)
     np.save(os.path.join(raw_folder, 'all_generated.npy'), sampled_seqs_np)
-
-    with torch.no_grad():
-        selected_idx, kl_scores, cluster_labels = ucfilter_kmeans_select_indices(
-            sampled_seqs.detach().cpu(),
-            num_clusters = 3,
-            k_ratio = 0.9,
-            sigma = 1.0,
-            embed_dim = 2,
-        )
-
-    selected_idx_np = selected_idx.numpy()
-    sampled_filtered = sampled_seqs_np[selected_idx_np]
+    print(f"Saved {len(sampled_seqs_np)} raw generated samples to {raw_folder}")
 
     # 反归一化生成的信号到原始尺度
-    # 从 [-1, 1] 反归一化到 [signal_min, signal_max]
     signal_min = dataset.signal_min
     signal_max = dataset.signal_max
     signal_range = signal_max - signal_min + 1e-8
-    
+
     # 反归一化公式：x_original = (x_norm + 1) / 2 * (max - min) + min
-    sampled_filtered_denorm = (sampled_filtered + 1.0) / 2.0 * signal_range + signal_min
-    
+    sampled_denorm = (sampled_seqs_np + 1.0) / 2.0 * signal_range + signal_min
+
     print(f"\n反归一化参数:")
     print(f"  signal_min: {signal_min:.4f}")
     print(f"  signal_max: {signal_max:.4f}")
-    print(f"  生成信号范围 (归一化): [{sampled_filtered.min():.4f}, {sampled_filtered.max():.4f}]")
-    print(f"  生成信号范围 (反归一化): [{sampled_filtered_denorm.min():.4f}, {sampled_filtered_denorm.max():.4f}]")
-    
+    print(f"  生成信号范围 (归一化): [{sampled_seqs_np.min():.4f}, {sampled_seqs_np.max():.4f}]")
+    print(f"  生成信号范围 (反归一化): [{sampled_denorm.min():.4f}, {sampled_denorm.max():.4f}]")
+
     # 幅值修正：基于训练数据的统计特性
-    # 计算训练数据的标准差和RMS
-    train_signals_original = dataset.signals  # 已经是归一化后的
-    # 反归一化训练数据用于计算统计量
-    train_signals_denorm = (train_signals_original + 1.0) / 2.0 * signal_range + signal_min
+    train_signals_denorm = (dataset.signals + 1.0) / 2.0 * signal_range + signal_min
     train_std = np.std(train_signals_denorm.flatten())
-    train_rms = np.sqrt(np.mean(train_signals_denorm.flatten()**2))
-    
-    # 计算生成信号的统计量
-    gen_std = np.std(sampled_filtered_denorm.flatten())
-    gen_rms = np.sqrt(np.mean(sampled_filtered_denorm.flatten()**2))
-    
-    # 计算修正系数（使用标准差，更稳定）
+    train_rms = np.sqrt(np.mean(train_signals_denorm.flatten() ** 2))
+
+    gen_std = np.std(sampled_denorm.flatten())
+    gen_rms = np.sqrt(np.mean(sampled_denorm.flatten() ** 2))
+
     if gen_std > 1e-8:
         amplitude_correction_factor = train_std / gen_std
         print(f"\n幅值修正分析:")
         print(f"  训练数据 std: {train_std:.4f}, RMS: {train_rms:.4f}")
         print(f"  生成数据 std: {gen_std:.4f}, RMS: {gen_rms:.4f}")
         print(f"  修正系数: {amplitude_correction_factor:.4f}")
-        
-        # 应用修正：保持均值不变，缩放波动部分
-        gen_mean = np.mean(sampled_filtered_denorm, axis=1, keepdims=True)
-        gen_centered = sampled_filtered_denorm - gen_mean
-        sampled_filtered_denorm = gen_mean + gen_centered * amplitude_correction_factor
-        
-        print(f"  修正后范围: [{sampled_filtered_denorm.min():.4f}, {sampled_filtered_denorm.max():.4f}]")
-        print(f"  修正后 std: {np.std(sampled_filtered_denorm.flatten()):.4f}")
+
+        gen_mean = np.mean(sampled_denorm, axis=1, keepdims=True)
+        gen_centered = sampled_denorm - gen_mean
+        sampled_denorm = gen_mean + gen_centered * amplitude_correction_factor
+
+        print(f"  修正后范围: [{sampled_denorm.min():.4f}, {sampled_denorm.max():.4f}]")
+        print(f"  修正后 std: {np.std(sampled_denorm.flatten()):.4f}")
     else:
         amplitude_correction_factor = 1.0
         print(f"\n警告: 生成信号标准差过小，跳过幅值修正")
 
+    # 保存最终样本
     filtered_folder = './generated_samples'
     os.makedirs(filtered_folder, exist_ok=True)
-    np.save(os.path.join(filtered_folder, 'selected_idx.npy'), selected_idx_np)
-    try:
-        kl_np = kl_scores.numpy()
-    except Exception:
-        kl_np = np.array(kl_scores)
-    np.save(os.path.join(filtered_folder, 'kl_scores.npy'), kl_np)
-    
-    # 保存归一化参数和修正参数
+
     np.save(os.path.join(filtered_folder, 'normalization_params.npy'), {
         'signal_min': signal_min,
         'signal_max': signal_max,
         'amplitude_correction_factor': amplitude_correction_factor,
         'train_std': train_std,
-        'train_rms': train_rms
+        'train_rms': train_rms,
     })
 
-    for i, (idx, gen_signal) in enumerate(zip(selected_idx_np, sampled_filtered_denorm)):
-        np.save(os.path.join(filtered_folder, f'generated_signal_{i}.npy'), gen_signal)
-        print(f"Saved UCFilter-selected generated signal {i} (orig idx={idx}) to {os.path.join(filtered_folder, f'generated_signal_{i}.npy')}")
+    for i, gen_signal in enumerate(sampled_denorm):
+        out_path = os.path.join(filtered_folder, f'generated_signal_{i}.npy')
+        np.save(out_path, gen_signal)
+        print(f"Saved generated signal {i} to {out_path}")
 
     print("\nScript completed.")
