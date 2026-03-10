@@ -7,7 +7,6 @@ from scipy.io import loadmat
 from denoising_diffusion_pytorch.denoising_diffusion_pytorch_1d import (
     PhysiNet,
     GaussianDiffusion1D,
-    ucfilter_kmeans_select_indices,
 )
 
 
@@ -208,40 +207,14 @@ def main():
     for i, sig in enumerate(sampled_denorm):
         np.save(os.path.join(raw_folder, f'raw_infer_signal_{i}.npy'), sig)
 
-    # 6) 使用 UCFilter（K-means + KL 边界）筛选高质量样本
-    print("Applying UCFilter (K-means + KL) to sampled sequences...")
-    with torch.no_grad():
-        selected_idx, kl_scores, cluster_labels = ucfilter_kmeans_select_indices(
-            sampled.detach().cpu(),
-            num_clusters=3,
-            k_ratio=0.9,
-            sigma=1.0,
-            embed_dim=2,
-        )
-
-    selected_idx_np = selected_idx.numpy()
-    print(f"Total sampled: {sampled.shape[0]}, selected by UCFilter: {len(selected_idx_np)}")
-
-    # 7) 反归一化到原始物理量级（与训练脚本一致）
-    sampled_denorm = sampled_denorm
-    sampled_filtered = sampled_denorm[selected_idx_np]
-
-    # 8) 保存生成且通过 UCFilter 筛选的样本到 ./generated_samples_infer
+    # 6) 直接保存所有反归一化后的生成样本到 ./generated_samples_infer
     save_folder = "./generated_samples_infer"
     os.makedirs(save_folder, exist_ok=True)
 
-    # 保存索引与 KL 分数
-    np.save(os.path.join(save_folder, 'selected_idx.npy'), selected_idx_np)
-    try:
-        kl_np = kl_scores.numpy()
-    except Exception:
-        kl_np = np.array(kl_scores)
-    np.save(os.path.join(save_folder, 'kl_scores.npy'), kl_np)
-
-    for i, (idx, sig) in enumerate(zip(selected_idx_np, sampled_filtered)):
+    for i, sig in enumerate(sampled_denorm):
         out_path = os.path.join(save_folder, f'infer_signal_{i}.npy')
         np.save(out_path, sig)
-        print(f"Saved UCFilter-selected generated signal #{i} (orig idx={idx}) to {out_path}")
+        print(f"Saved generated signal #{i} to {out_path}")
 
     print("Inference completed.")
 

@@ -1637,16 +1637,15 @@ class GaussianDiffusion1D(Module):
             loss_reg = F.mse_loss(pred_cond, cond_target.to(pred_cond.dtype))
 
         # ---- 流形对齐散度损失 loss_kl（J-FTSD 思路） ----
-        with torch.no_grad():
-            # 从当前目标预测中还原 pred_x0
-            if self.objective == 'pred_noise':
-                pred_x0 = self.predict_start_from_noise(x, t, model_out.detach())
-            elif self.objective == 'pred_x0':
-                pred_x0 = model_out.detach()
-            elif self.objective == 'pred_v':
-                pred_x0 = self.predict_start_from_v(x, t, model_out.detach())
-            else:
-                pred_x0 = x_start
+        # 从带梯度的 model_out 还原 pred_x0（保留完整梯度流）
+        if self.objective == 'pred_noise':
+            pred_x0 = self.predict_start_from_noise(x, t, model_out)
+        elif self.objective == 'pred_x0':
+            pred_x0 = model_out
+        elif self.objective == 'pred_v':
+            pred_x0 = self.predict_start_from_v(x, t, model_out)
+        else:
+            pred_x0 = x_start
         loss_kl = batch_kl_loss(x_start, pred_x0)
 
         # ---- 融合损失 ----
