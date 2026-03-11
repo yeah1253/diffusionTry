@@ -743,20 +743,24 @@ class PhysiNet(Module):
             nn.Linear(time_dim, time_dim)
         )
 
+        # ========== 物理先验提升层 ==========
+        # phys_conv: 将纯净机理信号提升到 init_dim 维特征空间
+        self.phys_conv = nn.Conv1d(channels, init_dim, 7, padding=3)
+
         # ========== 基于 Class Token 的异构条件联合嵌入网络 ==========
         if self.cond_dim > 0:
-            # (1) Condition Fusion MLP：将离散工况特征（RPM、Load 等）融合为
+            # (1) 工况分词器 cond_mlp：将离散工况特征（RPM、Load 等）融合为
             #     维度为 init_dim 的单一 Condition Token（Class Token）
-            self.cond_fusion_mlp = nn.Sequential(
+            self.cond_mlp = nn.Sequential(
                 nn.Linear(cond_dim, init_dim),
                 nn.GELU(),
                 nn.Linear(init_dim, init_dim),
             )
 
-            # (2) 1D 正弦位置编码（最大长度 2048，覆盖 L=1024 + 1 个 Class Token）
-            self.cond_pos_emb = SinusoidalPositionalEncoding1D(d_model=init_dim, max_len=2048)
+            # (2) 可学习位置编码（维度 1 x 2048 x init_dim）
+            self.cond_pos_emb = nn.Parameter(torch.randn(1, 2048, init_dim) * 0.02)
 
-            # (3) Transformer 编码器：对 [Class Token; 特征序列] 做自注意力
+            # (3) Transformer 编码器：对 [cls_token; v_phys_seq] 做自注意力
             encoder_layer = nn.TransformerEncoderLayer(
                 d_model=init_dim,
                 nhead=cond_transformer_heads,
@@ -769,10 +773,10 @@ class PhysiNet(Module):
                 num_layers=cond_transformer_layers,
             )
 
-            # (4) 特征对齐层：将 Transformer 输出的 Class Token (init_dim) 映射到 time_dim
+            # (4) 特征对齐层：将 Transformer 输出的 cls_token (init_dim) 映射到 time_dim
             self.cls_to_time = nn.Linear(init_dim, time_dim)
         else:
-            self.cond_fusion_mlp = None
+            self.cond_mlp = None
             self.cond_pos_emb = None
             self.cond_transformer = None
             self.cls_to_time = None
@@ -834,14 +838,15 @@ class PhysiNet(Module):
         else:
             self.cond_predictor = None
 
-    def forward(self, x, time, cond: Tensor = None, x_self_cond = None):
+    def forward(self, x, time, cond: Tensor = None, phys_signal: Tensor = None, x_self_cond = None):
         """
         条件去噪前向过程（基于 Class Token 的异构条件联合嵌入）。
 
         输入
-        - x: (B, C, L) 原始信号；
+        - x: (B, C, L) 带噪信号 x_t；
         - time: (B,) 离散时间步；
-        - cond: (B, cond_dim) 或 (B, cond_dim, L) 条件张量 / WCE；
+        - cond: (B, cond_dim) 或 (B, cond_dim, L) 条件张量（离散工况：负载/转速/故障）；
+        - phys_signal: (B, C, L) 纯净机理信号（物理先验），可选；
         - x_self_cond: 自条件（与 `Unet1D` 一致，默认关闭）。
         """
         # 1) 时间嵌入
@@ -852,11 +857,20 @@ class PhysiNet(Module):
             x_self_cond = default(x_self_cond, lambda: torch.zeros_like(x))
             x = torch.cat((x_self_cond, x), dim=1)
 
-        # 3) Lifting：将输入提前提升到高维特征 v0(x)（在条件嵌入之前完成）
+        # 3) 数据驱动提升层：将带噪信号提升到高维特征 v0(x)
         v0 = self.init_conv(x)  # (B, init_dim, L)
 
-        # 4) 基于 Class Token 的异构条件联合嵌入
-        if self.cond_dim > 0 and cond is not None and exists(self.cond_fusion_mlp):
+        # 4) 基于 Class Token 的异构条件联合嵌入（双分支融合）
+        if self.cond_dim > 0 and cond is not None and exists(self.cond_mlp):
+            # ---- 物理先验提升层 ----
+            if phys_signal is not None:
+                v_phys = self.phys_conv(phys_signal)        # (B, init_dim, L)
+                v_phys_seq = v_phys.transpose(1, 2)         # (B, L, init_dim)
+            else:
+                # 若无物理信号，退化为使用 v0 的转置作为序列
+                v_phys_seq = v0.transpose(1, 2)             # (B, L, init_dim)
+
+            # ---- 工况分词器 ----
             # 兼容 (B, cond_dim) 或 (B, cond_dim, L) 的输入形状：
             if cond.dim() == 3:
                 cond_vec = cond.mean(dim=-1)       # (B, cond_dim)
@@ -866,29 +880,26 @@ class PhysiNet(Module):
                 raise ValueError(
                     f"cond must have shape (B, cond_dim) or (B, cond_dim, L), got {tuple(cond.shape)}"
                 )
+            cls_token = self.cond_mlp(cond_vec)             # (B, init_dim)
+            cls_token = cls_token.unsqueeze(1)               # (B, 1, init_dim)
 
-            # 第二步：生成 Class Token — 将工况条件映射为 init_dim 维的 Condition Token
-            z_cond = self.cond_fusion_mlp(cond_vec)   # (B, init_dim)
-            z_cond = z_cond.unsqueeze(1)               # (B, 1, init_dim)
+            # ---- 序列拼接与 Transformer 深度融合 ----
+            joint_seq = torch.cat([cls_token, v_phys_seq], dim=1)  # (B, L+1, init_dim)
 
-            # 第三步：维度转换与级联拼接
-            v0_seq = v0.transpose(1, 2)                # (B, L, init_dim)
+            # 添加可学习位置编码（截取前 L+1 个位置）
+            seq_len = joint_seq.size(1)
+            joint_seq = joint_seq + self.cond_pos_emb[:, :seq_len, :]
 
-            # 将 Class Token 前置拼接到特征序列
-            x_joint = torch.cat([z_cond, v0_seq], dim=1)  # (B, L+1, init_dim)
-
-            # 第四步：添加位置编码并送入 Transformer 编码器做自注意力运算
             # 在 float32 下运行 Transformer 以保持数值稳定性（AMP 兼容）
-            x_joint_f32 = x_joint.float()
-            x_joint_f32 = self.cond_pos_emb(x_joint_f32)       # (B, L+1, init_dim)
-            x_joint_f32 = self.cond_transformer(x_joint_f32)    # (B, L+1, init_dim)
+            joint_seq_f32 = joint_seq.float()
+            joint_seq_f32 = self.cond_transformer(joint_seq_f32)    # (B, L+1, init_dim)
 
-            # 第五步：提取更新后的 Class Token（第 0 个位置）
-            cls_token = x_joint_f32[:, 0, :]             # (B, init_dim)
+            # ---- 全局 Context 提取与维度映射 ----
+            cls_out = joint_seq_f32[:, 0, :]                # (B, init_dim)
+            cond_emb = self.cls_to_time(cls_out)            # (B, time_dim)
 
-            # 第六步：映射到 time_dim 并注入时间嵌入
-            cond_emb = self.cls_to_time(cls_token)       # (B, time_dim)
-            t = t + cond_emb.to(t.dtype)                 # 条件注入
+            # ---- 时间步嵌入与工况条件深度绑定 ----
+            t = t + cond_emb.to(t.dtype)                    # t_updated = t + cond_emb
 
         # 5) U-Fourier Layer：得到物理驱动故障分量 P_{i,t}(x)
         p_it = self.u_fourier(v0, t)  # (B, init_dim, L)
@@ -921,14 +932,14 @@ class PhysiNet(Module):
 
             x_u = upsample(x_u)
 
-        # 7) 物理分量重加权并与域特征融合（式 (9)）
+        # 7) 物理分量重加权并与域特征融合（Reweight 卷积 + 加和融合 & 激活）
         p_weighted = self.act_sigma1(self.reweight(p_it))
         c_it = self.act_sigma2(x_u + p_weighted)
 
-        # 8) 投影得到 x_{t-1}（式 (10)），与 DDPM-Backbone 接口兼容
+        # 8) 投影得到 x_out（输出投影层 proj_Q）
         x_out = self.proj_Q(c_it)
 
-        # 9) 工况回归分支（TSTR 思路）：对 c_it 全局平均池化后预测条件向量
+        # 9) 工况回归分支（全局平均池化 & 线性预测头 → TSTR 辅助任务）
         if self.cond_predictor is not None:
             global_feat = c_it.mean(dim=-1)          # (B, init_dim)
             pred_cond = self.cond_predictor(global_feat)  # (B, cond_dim)
@@ -1666,12 +1677,16 @@ class GaussianDiffusion1D(Module):
         img = self.normalize(img)
 
         # Extract optional condition and model_forward_kwargs, merge and pass into p_losses
-        #条件参数传递逻辑:将cond传递给更底层的PhysiNet网络
+        #条件参数传递逻辑:将cond和phys_signal传递给更底层的PhysiNet网络
         cond = kwargs.pop('cond', None)
+        phys_signal = kwargs.pop('phys_signal', None)
         model_forward_kwargs = kwargs.pop('model_forward_kwargs', {})
         if cond is not None:
             # pass condition to the underlying model (PhysiNet expects 'cond' kwarg)
             model_forward_kwargs = {**model_forward_kwargs, 'cond': cond}
+        if phys_signal is not None:
+            # pass physics signal to the underlying model (PhysiNet expects 'phys_signal' kwarg)
+            model_forward_kwargs = {**model_forward_kwargs, 'phys_signal': phys_signal}
 
         noise = kwargs.pop('noise', None)
         return_reduced = kwargs.pop('return_reduced_loss', True)

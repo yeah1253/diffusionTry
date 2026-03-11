@@ -145,32 +145,48 @@ def main():
             sampled_denorm = (sampled_np + 1.0) / 2.0 * signal_range + signal_min
 
             # 运行 UCFilter 选取高质量子集
-            with torch.no_grad():
-                sel_idx, kl_scores, _ = ucfilter_kmeans_select_indices(
-                    sampled.detach().cpu(),
-                    num_clusters=3,
-                    k_ratio=0.9,
-                    sigma=1.0,
-                    embed_dim=2,
-                )
-            sel_idx = sel_idx.numpy()
+            max_keep = 10
+            try:
+                with torch.no_grad():
+                    sel_idx, kl_scores, _ = ucfilter_kmeans_select_indices(
+                        sampled.detach().cpu(),
+                        num_clusters=3,
+                        k_ratio=0.9,
+                        sigma=1.0,
+                        embed_dim=2,
+                    )
+                sel_idx = sel_idx.numpy()
+                try:
+                    kl_np = kl_scores.numpy()
+                except Exception:
+                    kl_np = np.array(kl_scores)
+            except Exception as e:
+                print(f"  Warning: UCFilter failed for load={load}, rpm={rpm}: {e}. Falling back to all samples.")
+                sel_idx = np.arange(len(sampled_denorm))
+                kl_np = np.zeros(len(sampled_denorm))
+
+            # 如果过滤后为空，回退到全部样本
+            if len(sel_idx) == 0:
+                print(f"  Warning: UCFilter returned empty for load={load}, rpm={rpm}. Using all samples.")
+                sel_idx = np.arange(len(sampled_denorm))
+                kl_np = np.zeros(len(sampled_denorm))
+
             filtered = sampled_denorm[sel_idx]
 
-            # 仅保留前10个高质量样本
-            max_keep = 10
-            if len(sel_idx) > max_keep:
+            # 截断到 max_keep；若不足 max_keep 则随机重采样补足（有放回）
+            if len(filtered) >= max_keep:
                 sel_idx = sel_idx[:max_keep]
                 filtered = filtered[:max_keep]
-                try:
-                    kl_np = kl_scores.numpy()
-                except Exception:
-                    kl_np = np.array(kl_scores)
                 kl_np = kl_np[:max_keep]
             else:
-                try:
-                    kl_np = kl_scores.numpy()
-                except Exception:
-                    kl_np = np.array(kl_scores)
+                n_have = len(filtered)
+                n_need = max_keep - n_have
+                extra_idx = np.random.choice(n_have, size=n_need, replace=True)
+                sel_idx = np.concatenate([sel_idx, sel_idx[extra_idx]])
+                filtered = np.concatenate([filtered, filtered[extra_idx]], axis=0)
+                kl_np = np.concatenate([kl_np, kl_np[extra_idx]])
+                print(f"  Info: Only {n_have} samples after UCFilter for load={load}, rpm={rpm}. "
+                      f"Resampled {n_need} extras to reach {max_keep}.")
 
             combo_folder = os.path.join(out_root, f"load_{int(load)}", f"rpm_{int(rpm)}")
             os.makedirs(combo_folder, exist_ok=True)
