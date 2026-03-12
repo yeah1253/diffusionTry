@@ -176,6 +176,9 @@ def interpolate_spectral_b(
     phase_vec    = np.tensordot(w, unit_phasors, axes=(0, 0))
     phase_interp = np.angle(phase_vec)
 
+    # 去直流：将 DC 频点（index 0）置零，消除高直流偏置
+    mag_interp[0] = 0.0
+
     return irfft(mag_interp * np.exp(1j * phase_interp), n=n_sig).real
 
 
@@ -217,6 +220,7 @@ def _stage1_freq_augment(
     x_all = np.arange(F, dtype=np.float64)
     gain_curve = np.clip(cs(x_all), 0.0, None)   # ensure non-negative gain
     spec = spec * gain_curve                       # modulate complex spectrum
+    spec[0] = 0.0                                  # 保持去直流：DC 频点始终为 0
 
     # ── Step B: Power-preserving Phase Jitter ─────────────────────
     mag   = np.abs(spec)

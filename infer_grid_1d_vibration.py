@@ -4,7 +4,7 @@ import numpy as np
 import torch
 from scipy.io import loadmat
 
-from denoising_diffusion_pytorch.denoising_diffusion_pytorch_1d import (
+from denoising_diffusion_pytorch.denoising_diffusion_pytorch_1d_grid import (
     PhysiNet,
     GaussianDiffusion1D,
     ucfilter_kmeans_select_indices,
@@ -33,9 +33,11 @@ def find_latest_checkpoint(results_folder: str) -> str:
     return paths[-1]
 
 
-def build_model_and_diffusion(seq_length: int, channels: int, cond_dim: int = 2) -> GaussianDiffusion1D:
+def build_model_and_diffusion(seq_length: int, channels: int, cond_dim: int = 2,
+                              legacy_cond: bool = False) -> GaussianDiffusion1D:
     """
     构建与训练阶段一致的 PhysiNet + GaussianDiffusion1D 结构。
+    legacy_cond=True 时使用旧版条件注入结构（cond_mlp 直接输出 time_dim）。
     """
     model = PhysiNet(
         dim=128,
@@ -45,6 +47,7 @@ def build_model_and_diffusion(seq_length: int, channels: int, cond_dim: int = 2)
         dropout=0.1,
         attn_dim_head=64,
         attn_heads=8,
+        legacy_cond=legacy_cond,
     )
 
     diffusion = GaussianDiffusion1D(
@@ -56,6 +59,20 @@ def build_model_and_diffusion(seq_length: int, channels: int, cond_dim: int = 2)
     )
 
     return diffusion
+
+
+def _is_legacy_checkpoint(ckpt_path: str) -> bool:
+    """
+    通过检测 model state_dict 是否含有新版专属 key 来判断 checkpoint 版本。
+    旧版没有 'model.cond_pos_emb' / 'model.phys_conv.weight'。
+    """
+    try:
+        data = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+        sd = data.get("model", {})
+        new_keys = {"model.cond_pos_emb", "model.phys_conv.weight", "model.cond_transformer.layers.0.self_attn.in_proj_weight"}
+        return not any(k in sd for k in new_keys)
+    except Exception:
+        return False
 
 
 def load_trained_diffusion_from_checkpoint(
@@ -111,7 +128,13 @@ def main():
     ckpt_path = find_latest_checkpoint(RESULTS_FOLDER)
     print(f"Loading checkpoint: {ckpt_path}")
 
-    diffusion = build_model_and_diffusion(SEQ_LENGTH, CHANNELS, cond_dim=COND_DIM)
+    legacy = _is_legacy_checkpoint(ckpt_path)
+    if legacy:
+        print("Detected legacy checkpoint (old cond_mlp structure). Using legacy_cond=True.")
+    else:
+        print("Detected new checkpoint (Transformer cond structure). Using legacy_cond=False.")
+
+    diffusion = build_model_and_diffusion(SEQ_LENGTH, CHANNELS, cond_dim=COND_DIM, legacy_cond=legacy)
     diffusion.to(device)
     diffusion = load_trained_diffusion_from_checkpoint(ckpt_path, diffusion)
 
