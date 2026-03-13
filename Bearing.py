@@ -4,6 +4,20 @@ from scipy.signal import hilbert
 import matplotlib.pyplot as plt
 import matplotlib as mpl
 
+# 故障类型映射（含部位/深度mm）；NC 表示正常，不调用机理模型
+FAULT_TYPE_MAP = {
+    "NC":   {"component": "normal", "depth_mm": 0.0},
+    "IF0.2": {"component": "inner",  "depth_mm": 0.2},
+    "IF0.4": {"component": "inner",  "depth_mm": 0.4},
+    "IF0.6": {"component": "inner",  "depth_mm": 0.6},
+    "OF0.2": {"component": "outer",  "depth_mm": 0.2},
+    "OF0.4": {"component": "outer",  "depth_mm": 0.4},
+    "OF0.6": {"component": "outer",  "depth_mm": 0.6},
+    "RF0.2": {"component": "ball",   "depth_mm": 0.2},
+    "RF0.4": {"component": "ball",   "depth_mm": 0.4},
+    "RF0.6": {"component": "ball",   "depth_mm": 0.6},
+}
+
 # 设置中文字体支持
 plt.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans', 'Arial Unicode MS', 'sans-serif']
 plt.rcParams['axes.unicode_minus'] = False  # 解决负号显示问题
@@ -18,6 +32,18 @@ fault_type = 'ball'
 Fx_history = []
 Fy_history = []
 
+def set_fault_by_key(fault_key: str):
+    """根据故障键设置全局 fault_type 与故障尺寸 L (m)。"""
+    global fault_type, L
+    if fault_key not in FAULT_TYPE_MAP:
+        raise ValueError(f"Unknown fault key: {fault_key}")
+    if fault_key == "NC":
+        raise RuntimeError("NC (Normal) provided: Bearing model should be skipped.")
+    info = FAULT_TYPE_MAP[fault_key]
+    fault_type = info["component"]  # 'inner' | 'outer' | 'ball'
+    L = info["depth_mm"] * 1e-3
+
+
 # 定义常微分方程函数
 def ode(t, y):
     global m1, m2, c1, c2, k1, k2, Fx, Fy, Wx, Wy, N, w, wc, wb, D, Dm, L, BPFO, BPFI, BPFB, delta_t, theta_dt, IO, fault_type
@@ -27,8 +53,8 @@ def ode(t, y):
     Fx = 0
     Fy = 0
 
-    D = 6e-3  # 滚动体直径 (m)
-    Dm = 22e-3  # 节圆直径 (m)
+    D = 7.938e-3  # 滚动体直径 (m) 6205 -> 7.938mm
+    Dm = 38.5e-3  # 节圆直径 (m) 近似 (25mm+52mm)/2
     m1 = 0.11005
     c1 = 1376
     k1 = 4.241 * 10 ** 4
@@ -42,13 +68,13 @@ def ode(t, y):
     w = N / 60 * 2 * np.pi  # 轴转速 (rad/s)
     wc = 0.5 * (w * (1 - D / Dm))  # 保持架转速 (rad/s)
     wb = (0.5 * Dm * w / D) * (1 - (D / Dm) ** 2)  # 滚动体自转速度 (rad/s)
-    Nb = 7  # 滚动体数量
+    Nb = 9  # 滚动体数量 (6205 型号)
     alpha_0 = 0
     gamma = (D * np.cos(alpha_0)) / Dm
     delta = 5 * 10 ** (-6) #游隙
     Wx = 0 # x方向外部载荷
     Wy = -0.9849 # y方向外部载荷
-    L = 0.4e-3  # 故障尺寸
+    L = L  # 使用全局故障尺寸 (由 set_fault_by_key 设置)
 
 
 
@@ -172,9 +198,23 @@ def FFT(t, y):
 
 
 # 主仿真
-def main():
-    # 初始化全局变量
-    global L, w, wc, BPFO, BPFI, BPFB, delta_t, theta_dt, wb, fault_type
+def main(fault_key: str = None, no_plot: bool = False, target_len: int = None):
+    """
+    Run bearing simulation.
+    - fault_key: one of FAULT_TYPE_MAP keys; if None, uses current global fault_type/L
+    - no_plot: if True, skip plotting and return phys_signal (dy[:,7])
+    - target_len: if set, resample phys_signal to this length
+    """
+    global L, w, wc, BPFO, BPFI, BPFB, delta_t, theta_dt, wb, fault_type, Fx_history, Fy_history
+
+    # reset histories for fresh run
+    Fx_history = []
+    Fy_history = []
+
+    if fault_key is not None:
+        if fault_key == "NC":
+            raise RuntimeError("FAULT_KEY=NC, Bearing simulation should be skipped.")
+        set_fault_by_key(fault_key)
 
     if fault_type not in {'ball', 'outer', 'inner'}:
         raise ValueError("fault_type must be one of: 'ball', 'outer', 'inner'")
@@ -214,8 +254,8 @@ def main():
 
         # 信息输出
         # 计算参数值
-        D = 6e-3  # 滚动体直径 (m)
-        Dm = 22e-3  # 节圆直径 (m)
+        D = 7.938e-3  # 滚动体直径 (m)
+        Dm = 38.5e-3  # 节圆直径 (m)
         N = 900  # 转速 (RPM)
         delta = 5 * 10 ** (-6)
         Ri = (Dm - D) / 2 - delta
@@ -223,8 +263,8 @@ def main():
         w = N / 60 * 2 * np.pi  # 轴转速 (rad/s)
         wc = 0.5 * (w * (1 - D / Dm))  # 保持架转速 (rad/s)
         wb = (0.5 * Dm * w / D) * (1 - (D / Dm) ** 2)  # 滚动体自转速度 (rad/s)
-        Nb = 7  # 滚动体数量
-        L = 0.4e-3  # 故障尺寸
+        Nb = 9  # 滚动体数量
+        L = L  # 使用全局故障尺寸
 
 
         BPFO = (Nb * N / 120) * (1 - D / Dm)  # 外圈故障特征频率
@@ -239,6 +279,17 @@ def main():
         delta_t = theta_dt_o / (w - wc)  # 双冲击间隔
 
         dr = D / 2 - ((D / 2) ** 2 - (L / 2) ** 2) ** 0.5
+
+        if no_plot:
+            phys_signal = dy[:, 7]  # 轴承座垂直方向加速度
+            if target_len is not None and len(phys_signal) != target_len:
+                idx = np.linspace(0, len(phys_signal) - 1, target_len).astype(int)
+                phys_signal = phys_signal[idx]
+            # 归一化到 [-1,1]
+            pmin, pmax = phys_signal.min(), phys_signal.max()
+            prange = pmax - pmin + 1e-8
+            phys_signal = 2.0 * (phys_signal - pmin) / prange - 1.0
+            return phys_signal.astype(np.float32)
 
         print(f"转轴速度 = {w:.4f} rad/s")
         print(f"保持架转速 = {wc:.4f} rad/s")
@@ -370,4 +421,10 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # 选择故障类型：IF0.2/IF0.4/IF0.6/OF0.2/OF0.4/OF0.6/RF0.2/RF0.4/RF0.6；NC 不调用本脚本
+    FAULT_KEY = "IF0.2"
+    if FAULT_KEY == "NC":
+        print("FAULT_KEY=NC, 跳过 Bearing 机理仿真。")
+    else:
+        set_fault_by_key(FAULT_KEY)
+        main()

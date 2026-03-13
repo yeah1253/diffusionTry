@@ -15,6 +15,7 @@ from denoising_diffusion_pytorch.denoising_diffusion_pytorch_1d import (
 )
 
 import matplotlib.pyplot as plt
+import Bearing
 
 # 故障类型映射：键为文件名前缀，值包含编号、部位、故障深度（mm）
 FAULT_TYPE_MAP = {
@@ -242,6 +243,21 @@ if __name__ == '__main__':
     DATA_PATH = r'D:\data\轴承数据集\IF0.2'
     OVERLAP = 0.5  # 滑动窗口重叠比例
     USE_CONDITION = True  # 是否使用条件（从文件名提取 RPM），False 表示无条件生成
+
+    # 自动根据路径推断故障类型 key（目录名）
+    fault_key = os.path.basename(DATA_PATH)
+    phys_signal = None
+    if fault_key != 'NC' and fault_key in Bearing.FAULT_TYPE_MAP:
+        try:
+            print(f"Generating phys_signal via Bearing model for fault_key={fault_key} ...")
+            phys_signal = Bearing.main(fault_key=fault_key, no_plot=True, target_len=SEQ_LENGTH)
+            np.save('phys_signal.npy', phys_signal)
+            print("phys_signal saved to phys_signal.npy")
+        except Exception as e:
+            print(f"Warning: Bearing simulation failed for fault_key={fault_key}: {e}")
+            phys_signal = None
+    else:
+        print(f"fault_key={fault_key} -> skip Bearing phys_signal generation.")
 
     print(f"Loading real SDUST dataset from {DATA_PATH}...")
     dataset = RealSDUSTDataset(
