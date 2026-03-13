@@ -16,6 +16,20 @@ from denoising_diffusion_pytorch.denoising_diffusion_pytorch_1d import (
 
 import matplotlib.pyplot as plt
 
+# 故障类型映射：键为文件名前缀，值包含编号、部位、故障深度（mm）
+FAULT_TYPE_MAP = {
+    "NC":   {"id": 0, "component": "normal",  "depth_mm": 0.0},
+    "IF0.2": {"id": 1, "component": "inner",   "depth_mm": 0.2},
+    "IF0.4": {"id": 2, "component": "inner",   "depth_mm": 0.4},
+    "IF0.6": {"id": 3, "component": "inner",   "depth_mm": 0.6},
+    "OF0.2": {"id": 4, "component": "outer",   "depth_mm": 0.2},
+    "OF0.4": {"id": 5, "component": "outer",   "depth_mm": 0.4},
+    "OF0.6": {"id": 6, "component": "outer",   "depth_mm": 0.6},
+    "RF0.2": {"id": 7, "component": "roller",  "depth_mm": 0.2},
+    "RF0.4": {"id": 8, "component": "roller",  "depth_mm": 0.4},
+    "RF0.6": {"id": 9, "component": "roller",  "depth_mm": 0.6},
+}
+
 # Real SDUST bearing dataset loader
 class RealSDUSTDataset(torch.utils.data.Dataset):
     """
@@ -54,38 +68,48 @@ class RealSDUSTDataset(torch.utils.data.Dataset):
                 
                 # 提取 y_values 的第一列
                 signal = data['Signal']['y_values'][0, 0]['values'].item()[:, 0]
-                
-                # 从文件名提取 RPM 和 Load（如果启用条件）
-                # 文件名格式: "NC 1800 0.mat" -> RPM=1800, Load=0
+
+                # 文件名格式示例: "IF0.2 1000 0.mat" 或 "NC 2000 0.mat"
+                fault_type_key = None
+                fault_depth = None
                 rpm = None
                 load = None
                 if self.use_condition:
-                    # 提取文件名中的所有数字
-                    numbers = re.findall(r'(\d+)', os.path.basename(mat_file))
-                    if len(numbers) >= 2:
-                        rpm = float(numbers[0])   # 第一个数字是 RPM
-                        load = float(numbers[1])  # 第二个数字是 Load
-                    elif len(numbers) == 1:
+                    fname = os.path.basename(mat_file)
+                    for k in FAULT_TYPE_MAP.keys():
+                        if fname.startswith(k):
+                            fault_type_key = k
+                            break
+                    numbers = re.findall(r'([\d\.]+)', fname)
+                    if len(numbers) >= 3:
+                        # numbers[0] 通常就是故障深度，但我们优先用映射表保证一致
+                        rpm = float(numbers[1])
+                        load = float(numbers[2])
+                    elif len(numbers) == 2:
                         rpm = float(numbers[0])
-                        load = 0.0  # 默认负载为 0
-                    else:
-                        rpm = 2000.0  # 默认 RPM
-                        load = 0.0    # 默认负载
-                
+                        load = float(numbers[1])
+                    # 映射表兜底
+                    if fault_type_key is None:
+                        fault_type_key = 'NC'
+                    fault_depth = FAULT_TYPE_MAP[fault_type_key]['depth_mm']
+                    fault_id = FAULT_TYPE_MAP[fault_type_key]['id']
+
                 # 将长序列分割成多个样本
                 samples = create_samples(signal, self.seq_length, self.overlap)
-                
+
                 for sample in samples:
                     all_signals.append(sample.astype(np.float32))
-                    if self.use_condition and rpm is not None and load is not None:
-                        # 归一化 RPM: 假设范围 1000-3000
+                    if self.use_condition and None not in (fault_depth, rpm, load):
                         norm_rpm = (rpm - 1000.0) / 2000.0
-                        # 归一化 Load: 假设范围 0-60
                         norm_load = load / 60.0
-                        all_conditions.append(np.array([norm_rpm, norm_load], dtype=np.float32))
-                
-                print(f"  Extracted {len(samples)} samples from {len(signal)} data points (RPM={rpm}, Load={load})")
-                
+                        norm_fault = fault_depth / 1.0
+                        norm_fault_id = fault_id / 9.0  # 将 0-9 映射到 0-1
+                        all_conditions.append(
+                            np.array([norm_rpm, norm_load, norm_fault, norm_fault_id], dtype=np.float32)
+                        )
+
+                print(f"  Extracted {len(samples)} samples from {len(signal)} data points (Fault={fault_type_key}, RPM={rpm}, Load={load}, FaultDepth={fault_depth})")
+
             except Exception as e:
                 print(f"  Warning: Failed to load {mat_file}: {e}")
                 continue
@@ -107,15 +131,15 @@ class RealSDUSTDataset(torch.utils.data.Dataset):
         
         # 条件信息
         if self.use_condition and len(all_conditions) > 0:
-            self.conditions = np.stack(all_conditions, axis=0)  # (N, 2) - [RPM, Load]
-            self.cond_dim = 2
+            self.conditions = np.stack(all_conditions, axis=0)  # (N, 4)
+            self.cond_dim = 4
         else:
             self.conditions = None
             self.cond_dim = 0
         
         print(f"Total dataset size: {len(self.signals)} samples")
-        print(f"Condition dimension: {self.cond_dim} (RPM, Load)")
-    
+        print(f"Condition dimension: {self.cond_dim} (RPM, Load, FaultDepth, FaultId)")
+
     def __len__(self):
         return len(self.signals)
     
@@ -215,7 +239,7 @@ if __name__ == '__main__':
 
     # ---------- dataset configuration (real SDUST data) ----------
     SEQ_LENGTH = 1024
-    DATA_PATH = r'D:\speedLoad'
+    DATA_PATH = r'D:\data\轴承数据集\IF0.2'
     OVERLAP = 0.5  # 滑动窗口重叠比例
     USE_CONDITION = True  # 是否使用条件（从文件名提取 RPM），False 表示无条件生成
 
@@ -280,33 +304,28 @@ if __name__ == '__main__':
 
     # 根据是否有条件决定采样方式
     if COND_DIM > 0:
-        # 有条件模型：显式指定目标 RPM 和 Load
+        # 有条件模型：显式指定目标 RPM / Load / 故障深度 / 故障类型
+        TARGET_FAULT_TYPE = 'IF0.2'
+        TARGET_FAULT_DEPTH = FAULT_TYPE_MAP[TARGET_FAULT_TYPE]['depth_mm']
+        TARGET_FAULT_ID = FAULT_TYPE_MAP[TARGET_FAULT_TYPE]['id']
         TARGET_RPM = 2000.0
-        TARGET_LOAD = 40.0  # 可以修改为其他负载值，如 0, 20, 40, 60
+        TARGET_LOAD = 40.0
 
-        # 与数据集中的归一化方式保持一致
         target_norm_rpm = (TARGET_RPM - 1000.0) / 2000.0
         target_norm_load = TARGET_LOAD / 60.0
+        target_norm_fault = TARGET_FAULT_DEPTH / 1.0
+        target_norm_fault_id = TARGET_FAULT_ID / 9.0
 
-        print(f"Conditional generation enabled. Target RPM = {TARGET_RPM} (norm = {target_norm_rpm:.4f}), Load = {TARGET_LOAD} (norm = {target_norm_load:.4f})")
+        print(f"Conditional generation enabled. Fault={TARGET_FAULT_TYPE} (id={TARGET_FAULT_ID}, depth={TARGET_FAULT_DEPTH}), "
+              f"RPM={TARGET_RPM} (norm={target_norm_rpm:.4f}), Load={TARGET_LOAD} (norm={target_norm_load:.4f})")
 
-        # 构造条件批次张量 (batch, cond_dim)
         batch_size = 64
-        if COND_DIM == 2:
-            cond_batch = torch.tensor(
-                [[target_norm_rpm, target_norm_load]] * batch_size,
-                dtype=torch.float32,
-                device=device,
-            )
-        else:
-            cond_batch = torch.full(
-                (batch_size, COND_DIM),
-                fill_value=target_norm_rpm,
-                dtype=torch.float32,
-                device=device,
-            )
+        cond_batch = torch.tensor(
+            [[target_norm_rpm, target_norm_load, target_norm_fault, target_norm_fault_id]] * batch_size,
+            dtype=torch.float32,
+            device=device,
+        )
 
-        # 优先使用 Trainer1D 的 EMA 条件采样接口
         try:
             print("Sampling with Trainer1D.sample_with_condition (EMA model)...")
             sampled_seqs = trainer.sample_with_condition(
