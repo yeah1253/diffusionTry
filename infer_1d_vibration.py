@@ -140,12 +140,14 @@ def main():
     # 与训练脚本保持一致的超参数和数据路径
     SEQ_LENGTH = 1024
     CHANNELS = 1
-    COND_DIM = 2  # RPM 和 Load 两个条件
+    COND_DIM = 3  # RPM、Load、故障类型ID
     RESULTS_FOLDER = "./results_vibration"
     # # 训练数据集路径，用于获取归一化参数（如果检查点中没有保存）
     # TRAIN_DATA_PATH = r'D:\speedLoad'
     
     # 条件生成的目标值（可以修改）
+    TARGET_FAULT_TYPE = 'IF0.2'
+    TARGET_FAULT_ID = 1  # 与训练时 FAULT_TYPE_MAP 对齐
     TARGET_RPM = 2000.0
     TARGET_LOAD = 40.0  # 可选值: 0, 20, 40, 60
 
@@ -174,19 +176,20 @@ def main():
     # 5) 使用训练好的扩散模型进行条件采样生成信号
     num_samples = 64
     print(f"Sampling {num_samples} sequences from trained diffusion model...")
-    print(f"Conditional generation: RPM={TARGET_RPM}, Load={TARGET_LOAD}")
+    print(f"Conditional generation: Fault={TARGET_FAULT_TYPE} (id={TARGET_FAULT_ID}), RPM={TARGET_RPM}, Load={TARGET_LOAD}")
     
     # 归一化条件（与训练代码一致）
     target_norm_rpm = (TARGET_RPM - 1000.0) / 2000.0
     target_norm_load = TARGET_LOAD / 60.0
+    target_norm_fault_id = TARGET_FAULT_ID / 9.0
     
     # 构造条件批次张量 (batch, cond_dim)
     cond_batch = torch.tensor(
-        [[target_norm_rpm, target_norm_load]] * num_samples,
+        [[target_norm_rpm, target_norm_load, target_norm_fault_id]] * num_samples,
         dtype=torch.float32,
         device=device,
     )
-    print(f"Normalized conditions: RPM={target_norm_rpm:.4f}, Load={target_norm_load:.4f}")
+    print(f"Normalized conditions: RPM={target_norm_rpm:.4f}, Load={target_norm_load:.4f}, FaultID={target_norm_fault_id:.4f}")
 
     with torch.no_grad():
         # 条件采样

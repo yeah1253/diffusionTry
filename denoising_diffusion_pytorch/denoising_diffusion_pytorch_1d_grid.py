@@ -1656,14 +1656,6 @@ class GaussianDiffusion1D(Module):
         loss = loss * extract(self.loss_weight, t, loss.shape)
         loss_diff = loss  # 基础扩散 MSE 损失 (B,)
 
-        # ---- 工况回归损失 loss_reg（TSTR 思路） ----
-        loss_reg = torch.tensor(0.0, device=x_start.device)
-        if pred_cond is not None and 'cond' in model_forward_kwargs:
-            cond_target = model_forward_kwargs['cond']          # (B, cond_dim) 或 (B, cond_dim, L)
-            if cond_target.dim() == 3:
-                cond_target = cond_target.mean(dim=-1)          # -> (B, cond_dim)
-            loss_reg = F.mse_loss(pred_cond, cond_target.to(pred_cond.dtype))
-
         # ---- 流形对齐散度损失 loss_kl（J-FTSD 思路） ----
         # 从带梯度的 model_out 还原 pred_x0（保留完整梯度流）
         if self.objective == 'pred_noise':
@@ -1677,7 +1669,7 @@ class GaussianDiffusion1D(Module):
         loss_kl = batch_kl_loss(x_start, pred_x0)
 
         # ---- 融合损失 ----
-        total_loss = loss_diff.mean() + 0.1 * loss_reg + 0.01 * loss_kl
+        total_loss = loss_diff.mean() + 0.01 * loss_kl
 
         if not return_reduced_loss:
             # 仅在需要非缩减模式时返回原始 per-sample 损失（忽略辅助项）
