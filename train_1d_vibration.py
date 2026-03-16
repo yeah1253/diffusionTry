@@ -241,14 +241,15 @@ if __name__ == '__main__':
     DATA_PATH = r'D:\data\轴承数据集\IF0.2'
     OVERLAP = 0.5  # 滑动窗口重叠比例
     USE_CONDITION = True  # 是否使用条件（从文件名提取 RPM），False 表示无条件生成
+    BEARING_RPM = 2000.0  # Bearing 机理仿真转速 (RPM)，可根据需求修改以生成不同 phys_signal
 
     # 自动根据路径推断故障类型 key（目录名）
     fault_key = os.path.basename(DATA_PATH)
     phys_signal = None
     if fault_key != 'NC' and fault_key in Bearing.FAULT_TYPE_MAP:
         try:
-            print(f"Generating phys_signal via Bearing model for fault_key={fault_key} ...")
-            phys_signal = Bearing.main(fault_key=fault_key, no_plot=True, target_len=SEQ_LENGTH)
+            print(f"Generating phys_signal via Bearing model for fault_key={fault_key}, rpm={BEARING_RPM} ...")
+            phys_signal = Bearing.main(fault_key=fault_key, rpm=BEARING_RPM, no_plot=True, target_len=SEQ_LENGTH)
             np.save('phys_signal.npy', phys_signal)
             print("phys_signal saved to phys_signal.npy")
         except Exception as e:
@@ -307,6 +308,7 @@ if __name__ == '__main__':
         # 传入归一化参数，会保存到检查点中供推理时使用
         denorm_min = dataset.signal_min,
         denorm_max = dataset.signal_max,
+        phys_signal = phys_signal,    # 机理信号（按 BEARING_RPM 生成），作为物理先验
     )
 
     print("Starting training on real SDUST dataset...")
@@ -334,11 +336,24 @@ if __name__ == '__main__':
             device=device,
         )
 
+        # 为目标转速生成 phys_signal 作为物理先验（若 fault_key 有效）
+        model_kwargs = {}
+        if fault_key not in ('NC',) and fault_key in Bearing.FAULT_TYPE_MAP:
+            try:
+                phys_at_target = Bearing.main(fault_key=fault_key, rpm=TARGET_RPM, no_plot=True, target_len=SEQ_LENGTH)
+                phys_t = torch.from_numpy(phys_at_target).float().to(device).unsqueeze(0).unsqueeze(0)
+                phys_t = phys_t.expand(batch_size, -1, -1)
+                model_kwargs['phys_signal'] = phys_t
+                print(f"Using phys_signal at target RPM={TARGET_RPM} for sampling.")
+            except Exception as e:
+                print(f"Warning: Could not generate phys_signal at RPM={TARGET_RPM}: {e}")
+
         try:
             print("Sampling with Trainer1D.sample_with_condition (EMA model)...")
             sampled_seqs = trainer.sample_with_condition(
                 batch_size=batch_size,
                 cond=cond_batch,
+                model_forward_kwargs=model_kwargs if model_kwargs else None,
             )
             if sampled_seqs is None:
                 raise RuntimeError("trainer.sample_with_condition returned None")

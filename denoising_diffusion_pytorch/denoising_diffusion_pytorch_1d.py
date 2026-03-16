@@ -1,5 +1,6 @@
 import math
 import sys
+import numpy as np
 from pathlib import Path
 from random import random
 from functools import partial
@@ -1709,6 +1710,7 @@ class Trainer1D(object):
         max_grad_norm = 1.,
         denorm_min: float | None = None,
         denorm_max: float | None = None,
+        phys_signal: Tensor | None = None,  # 可选：机理信号 (L,) 或 (1,L)，会广播到 batch 作为物理先验
     ):
         super().__init__()
 
@@ -1726,6 +1728,8 @@ class Trainer1D(object):
         # optional denormalization range (used to convert model outputs back to physical units for plotting)
         self.denorm_min = denorm_min
         self.denorm_max = denorm_max
+        # optional physics prior signal (e.g. from Bearing at specific rpm)
+        self.phys_signal = phys_signal
 
         # sampling and training hyperparameters
 
@@ -1839,9 +1843,20 @@ class Trainer1D(object):
                     else:
                         cond = None
 
+                    phys_batch = None
+                    if getattr(self, 'phys_signal', None) is not None:
+                        ps = self.phys_signal
+                        if not isinstance(ps, torch.Tensor):
+                            ps = torch.from_numpy(np.asarray(ps, dtype=np.float32))
+                        if ps.dim() == 1:
+                            ps = ps.unsqueeze(0).unsqueeze(0)   # (1, 1, L)
+                        elif ps.dim() == 2:
+                            ps = ps.unsqueeze(0) if ps.shape[0] != 1 else ps  # (1, C, L)
+                        phys_batch = ps.expand(data.shape[0], -1, -1).to(device)
+
                     with self.accelerator.autocast():  # 模型训练
-                        # pass condition through the diffusion wrapper; GaussianDiffusion1D.forward will forward cond
-                        loss = self.model(data, cond=cond)
+                        # pass condition and phys_signal through the diffusion wrapper
+                        loss = self.model(data, cond=cond, phys_signal=phys_batch)
                         loss = loss / self.gradient_accumulate_every
                         total_loss += loss.item()
 

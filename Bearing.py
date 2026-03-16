@@ -24,7 +24,10 @@ plt.rcParams['axes.unicode_minus'] = False  # 解决负号显示问题
 mpl.rcParams['figure.max_open_warning'] = 0  # 禁止最大图形警告
 
 # 全局变量
-global m1, m2, c1, c2, k1, k2, Fx, Fy, Wx, Wy, N, w, wc, wb, D, Dm, L, BPFO, BPFI, BPFB, delta_t, theta_dt, IO, fault_type
+global m1, m2, c1, c2, k1, k2, Fx, Fy, Wx, Wy, N, w, wc, wb, D, Dm, L, BPFO, BPFI, BPFB, delta_t, theta_dt, IO, fault_type, _sim_rpm
+
+# 仿真转速 (RPM)，由 main(rpm=...) 设置，默认 900
+_sim_rpm = 900
 
 # 可选: 'ball' | 'outer' | 'inner'
 fault_type = 'ball'
@@ -46,7 +49,7 @@ def set_fault_by_key(fault_key: str):
 
 # 定义常微分方程函数
 def ode(t, y):
-    global m1, m2, c1, c2, k1, k2, Fx, Fy, Wx, Wy, N, w, wc, wb, D, Dm, L, BPFO, BPFI, BPFB, delta_t, theta_dt, IO, fault_type
+    global m1, m2, c1, c2, k1, k2, Fx, Fy, Wx, Wy, N, w, wc, wb, D, Dm, L, BPFO, BPFI, BPFB, delta_t, theta_dt, IO, fault_type, _sim_rpm
 
     dy = np.zeros(8)
 
@@ -61,7 +64,7 @@ def ode(t, y):
     m2 = 3.405461
     c2 = 2210.7
     k2 = 15.1056 * 10 ** 6
-    N = 900  # 转速 (RPM)
+    N = _sim_rpm  # 转速 (RPM)，由 main(rpm=...) 传入
     delta = 5 * 10 ** (-6)
     Ri = (Dm - D) / 2 - delta
     Ro = (Dm + D) / 2 + delta
@@ -198,15 +201,18 @@ def FFT(t, y):
 
 
 # 主仿真
-def main(fault_key: str = None, no_plot: bool = False, target_len: int = None):
+def main(fault_key: str = None, rpm: float = 900.0, no_plot: bool = False, target_len: int = None):
     """
     Run bearing simulation.
+
     - fault_key: one of FAULT_TYPE_MAP keys; if None, uses current global fault_type/L
+    - rpm: 转速 (RPM)，用于控制仿真特征频率，不同转速生成不同的 phys_signal
     - no_plot: if True, skip plotting and return phys_signal (dy[:,7])
     - target_len: if set, resample phys_signal to this length
     """
-    global L, w, wc, BPFO, BPFI, BPFB, delta_t, theta_dt, wb, fault_type, Fx_history, Fy_history
+    global L, w, wc, BPFO, BPFI, BPFB, delta_t, theta_dt, wb, fault_type, Fx_history, Fy_history, _sim_rpm
 
+    _sim_rpm = rpm
     # reset histories for fresh run
     Fx_history = []
     Fy_history = []
@@ -256,7 +262,7 @@ def main(fault_key: str = None, no_plot: bool = False, target_len: int = None):
         # 计算参数值
         D = 7.938e-3  # 滚动体直径 (m)
         Dm = 38.5e-3  # 节圆直径 (m)
-        N = 900  # 转速 (RPM)
+        N = rpm  # 转速 (RPM)，与仿真一致
         delta = 5 * 10 ** (-6)
         Ri = (Dm - D) / 2 - delta
         Ro = (Dm + D) / 2 + delta
