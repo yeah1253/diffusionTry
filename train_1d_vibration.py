@@ -103,9 +103,8 @@ class RealSDUSTDataset(torch.utils.data.Dataset):
                     if self.use_condition and None not in (fault_depth, rpm, load):
                         norm_rpm = (rpm - 1000.0) / 2000.0
                         norm_load = load / 60.0
-                        norm_fault_id = fault_id / 9  # 将 0-9 映射到 0-1，作为故障类型编码
                         all_conditions.append(
-                            np.array([norm_rpm, norm_load, norm_fault_id], dtype=np.float32)
+                            np.array([norm_rpm, norm_load], dtype=np.float32)
                         )
 
                 print(f"  Extracted {len(samples)} samples from {len(signal)} data points (Fault={fault_type_key}, RPM={rpm}, Load={load}, FaultDepth={fault_depth})")
@@ -131,14 +130,14 @@ class RealSDUSTDataset(torch.utils.data.Dataset):
         
         # 条件信息
         if self.use_condition and len(all_conditions) > 0:
-            self.conditions = np.stack(all_conditions, axis=0)  # (N, 3) -> [RPM, Load, FaultID]
-            self.cond_dim = 3
+            self.conditions = np.stack(all_conditions, axis=0)  # (N, 2) -> [RPM, Load]
+            self.cond_dim = 2
         else:
             self.conditions = None
             self.cond_dim = 0
         
         print(f"Total dataset size: {len(self.signals)} samples")
-        print(f"Condition dimension: {self.cond_dim} (RPM, Load, FaultId)")
+        print(f"Condition dimension: {self.cond_dim} (RPM, Load)")
 
     def __len__(self):
         return len(self.signals)
@@ -319,22 +318,18 @@ if __name__ == '__main__':
 
     # 根据是否有条件决定采样方式
     if COND_DIM > 0:
-        # 有条件模型：显式指定目标 RPM / Load / 故障类型
-        TARGET_FAULT_TYPE = 'IF0.2'
-        TARGET_FAULT_ID = FAULT_TYPE_MAP[TARGET_FAULT_TYPE]['id']
+        # 有条件模型：显式指定目标 RPM / Load
         TARGET_RPM = 2000.0
         TARGET_LOAD = 40.0
 
         target_norm_rpm = (TARGET_RPM - 1000.0) / 2000.0
         target_norm_load = TARGET_LOAD / 60.0
-        target_norm_fault_id = TARGET_FAULT_ID / 9.0
 
-        print(f"Conditional generation enabled. Fault={TARGET_FAULT_TYPE} (id={TARGET_FAULT_ID}), "
-              f"RPM={TARGET_RPM} (norm={target_norm_rpm:.4f}), Load={TARGET_LOAD} (norm={target_norm_load:.4f})")
+        print(f"Conditional generation enabled. RPM={TARGET_RPM} (norm={target_norm_rpm:.4f}), Load={TARGET_LOAD} (norm={target_norm_load:.4f})")
 
         batch_size = 64
         cond_batch = torch.tensor(
-            [[target_norm_rpm, target_norm_load, target_norm_fault_id]] * batch_size,
+            [[target_norm_rpm, target_norm_load]] * batch_size,
             dtype=torch.float32,
             device=device,
         )
