@@ -1829,12 +1829,21 @@ class Trainer1D(object):
 
                 for _ in range(self.gradient_accumulate_every): #gradient_accumulate_every是等效批，即等效批次 = batchsize * gradient_accumulate_every,即循环gradient_accumulate_every次之后再进行梯度更新
                     batch = next(self.dl)  # 获取一个batch(48个样本)的数据
-                    # dataloader may return (data, cond) or just data
-                    if isinstance(batch, (list, tuple)) and len(batch) == 2:
-                        data, cond = batch
+                    # dataloader may return (data, cond), (data, cond, phys_signal), or just data
+                    if isinstance(batch, (list, tuple)):
+                        if len(batch) == 3:
+                            data, cond, batch_phys = batch
+                        elif len(batch) == 2:
+                            data, cond = batch
+                            batch_phys = None
+                        else:
+                            data = batch[0] if len(batch) > 0 else batch
+                            cond = None
+                            batch_phys = None
                     else:
                         data = batch
                         cond = None
+                        batch_phys = None
 
                     # move tensors to device (safe even if already on device)
                     data = data.to(device)
@@ -1844,7 +1853,13 @@ class Trainer1D(object):
                         cond = None
 
                     phys_batch = None
-                    if getattr(self, 'phys_signal', None) is not None:
+                    if batch_phys is not None and isinstance(batch_phys, torch.Tensor) and batch_phys.numel() > 0:
+                        # 使用 batch 内每样本的 phys_signal（由 dataset 按 fault_key+rpm 提供）
+                        if batch_phys.dim() == 2:
+                            batch_phys = batch_phys.unsqueeze(1)  # (B, L) -> (B, 1, L)
+                        phys_batch = batch_phys.to(device).float()
+                    elif getattr(self, 'phys_signal', None) is not None:
+                        # 回退到全局 phys_signal
                         ps = self.phys_signal
                         if not isinstance(ps, torch.Tensor):
                             ps = torch.from_numpy(np.asarray(ps, dtype=np.float32))

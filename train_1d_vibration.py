@@ -44,12 +44,14 @@ class RealSDUSTDataset(torch.utils.data.Dataset):
     - seq_length: 每个样本的序列长度
     - overlap: 滑动窗口的重叠比例 (0-1)
     - use_condition: 是否使用条件（从文件名提取 RPM 和 Load），如果 False 则 cond_dim=0
+    - use_phys_signal: 是否按每样本的 (fault_key, rpm) 生成机理 phys_signal 作为物理先验
     """
-    def __init__(self, data_path, seq_length=1024, overlap=0.5, use_condition=False):
+    def __init__(self, data_path, seq_length=1024, overlap=0.5, use_condition=False, use_phys_signal=False):
         super().__init__()
         self.seq_length = int(seq_length)
         self.overlap = float(overlap)
         self.use_condition = use_condition
+        self.use_phys_signal = use_phys_signal and use_condition
         
         # 查找所有 .mat 文件
         mat_files = glob.glob(os.path.join(data_path, '*.mat'))
@@ -61,6 +63,7 @@ class RealSDUSTDataset(torch.utils.data.Dataset):
         # 加载所有数据
         all_signals = []
         all_conditions = []
+        all_phys_keys = []  # 每样本的 (fault_type_key, rpm) 用于生成 phys_signal
         
         for mat_file in sorted(mat_files):
             print(f"Loading {os.path.basename(mat_file)}...")
@@ -98,14 +101,20 @@ class RealSDUSTDataset(torch.utils.data.Dataset):
                 # 将长序列分割成多个样本
                 samples = create_samples(signal, self.seq_length, self.overlap)
 
+                has_valid_cond = self.use_condition and None not in (fault_depth, rpm, load)
                 for sample in samples:
                     all_signals.append(sample.astype(np.float32))
-                    if self.use_condition and None not in (fault_depth, rpm, load):
+                    if has_valid_cond:
                         norm_rpm = (rpm - 1000.0) / 2000.0
                         norm_load = load / 60.0
                         all_conditions.append(
                             np.array([norm_rpm, norm_load], dtype=np.float32)
                         )
+                        all_phys_keys.append((fault_type_key, rpm))
+                    else:
+                        if self.use_condition:
+                            all_conditions.append(np.array([0.0, 0.0], dtype=np.float32))  # 兜底以保持长度一致
+                        all_phys_keys.append((fault_type_key, rpm))
 
                 print(f"  Extracted {len(samples)} samples from {len(signal)} data points (Fault={fault_type_key}, RPM={rpm}, Load={load}, FaultDepth={fault_depth})")
 
@@ -136,6 +145,20 @@ class RealSDUSTDataset(torch.utils.data.Dataset):
             self.conditions = None
             self.cond_dim = 0
         
+        # 按 (fault_key, rpm) 缓存 phys_signal：每个文件转速不同，需分别生成
+        self.phys_signal_cache = {}
+        self.phys_keys = all_phys_keys  # 与 all_signals 对应的 (fault_key, rpm)，仅 use_condition 时有效
+        if self.use_phys_signal:
+            unique_keys = set((k, r) for k, r in all_phys_keys if k is not None and k != 'NC' and r is not None)
+            for fault_key, rpm in sorted(unique_keys):
+                try:
+                    print(f"Generating phys_signal for fault_key={fault_key}, rpm={rpm} ...")
+                    ps = Bearing.main(fault_key=fault_key, rpm=rpm, no_plot=True, target_len=self.seq_length)
+                    self.phys_signal_cache[(fault_key, rpm)] = ps.astype(np.float32)
+                except Exception as e:
+                    print(f"  Warning: Bearing failed for ({fault_key}, {rpm}): {e}")
+            print(f"phys_signal cache: {len(self.phys_signal_cache)} unique (fault_key, rpm) combinations")
+        
         print(f"Total dataset size: {len(self.signals)} samples")
         print(f"Condition dimension: {self.cond_dim} (RPM, Load)")
 
@@ -146,8 +169,17 @@ class RealSDUSTDataset(torch.utils.data.Dataset):
         sig = torch.from_numpy(self.signals[idx]).unsqueeze(0)  # (1, L)
         
         if self.use_condition and self.conditions is not None:
-            cond = torch.from_numpy(self.conditions[idx])  # (1,)
-            return sig, cond
+            cond = torch.from_numpy(self.conditions[idx])  # (2,)
+            phys_sig = None
+            if self.use_phys_signal:
+                fault_key, rpm = self.phys_keys[idx]
+                if fault_key is not None and fault_key != 'NC' and rpm is not None:
+                    key = (fault_key, rpm)
+                    if key in self.phys_signal_cache:
+                        phys_sig = torch.from_numpy(self.phys_signal_cache[key].copy()).unsqueeze(0)  # (1, L)
+            if phys_sig is None:
+                phys_sig = torch.zeros(1, self.seq_length, dtype=torch.float32)  # 无 phys 时用零，便于 collate
+            return sig, cond, phys_sig
         else:
             return sig
 
@@ -241,29 +273,18 @@ if __name__ == '__main__':
     DATA_PATH = r'D:\data\轴承数据集\IF0.2'
     OVERLAP = 0.5  # 滑动窗口重叠比例
     USE_CONDITION = True  # 是否使用条件（从文件名提取 RPM），False 表示无条件生成
-    BEARING_RPM = 2000.0  # Bearing 机理仿真转速 (RPM)，可根据需求修改以生成不同 phys_signal
+    USE_PHYS_SIGNAL = True  # 是否按每文件的 fault_key+rpm 生成机理 phys_signal 作为物理先验
 
     # 自动根据路径推断故障类型 key（目录名）
     fault_key = os.path.basename(DATA_PATH)
-    phys_signal = None
-    if fault_key != 'NC' and fault_key in Bearing.FAULT_TYPE_MAP:
-        try:
-            print(f"Generating phys_signal via Bearing model for fault_key={fault_key}, rpm={BEARING_RPM} ...")
-            phys_signal = Bearing.main(fault_key=fault_key, rpm=BEARING_RPM, no_plot=True, target_len=SEQ_LENGTH)
-            np.save('phys_signal.npy', phys_signal)
-            print("phys_signal saved to phys_signal.npy")
-        except Exception as e:
-            print(f"Warning: Bearing simulation failed for fault_key={fault_key}: {e}")
-            phys_signal = None
-    else:
-        print(f"fault_key={fault_key} -> skip Bearing phys_signal generation.")
 
     print(f"Loading real SDUST dataset from {DATA_PATH}...")
     dataset = RealSDUSTDataset(
         data_path=DATA_PATH,
         seq_length=SEQ_LENGTH,
         overlap=OVERLAP,
-        use_condition=USE_CONDITION
+        use_condition=USE_CONDITION,
+        use_phys_signal=USE_PHYS_SIGNAL,
     )
     print(f"Dataset size: {len(dataset)}, seq_length={SEQ_LENGTH}")
 
@@ -308,7 +329,7 @@ if __name__ == '__main__':
         # 传入归一化参数，会保存到检查点中供推理时使用
         denorm_min = dataset.signal_min,
         denorm_max = dataset.signal_max,
-        phys_signal = phys_signal,    # 机理信号（按 BEARING_RPM 生成），作为物理先验
+        # phys_signal 由 dataset 按每样本的 fault_key+rpm 提供，不在此传入
     )
 
     print("Starting training on real SDUST dataset...")
