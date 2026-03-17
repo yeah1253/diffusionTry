@@ -833,12 +833,6 @@ class PhysiNet(Module):
         # 使用基于连续小波变换（CWT）和累积能量占比法的实现
         self.u_fourier = UFourierLayer(channels = init_dim, time_dim = time_dim, energy_threshold = 0.9)
 
-        # 工况回归头（TSTR 思路）：从全局池化特征预测条件向量
-        if self.cond_dim > 0:
-            self.cond_predictor = nn.Linear(init_dim, cond_dim)
-        else:
-            self.cond_predictor = None
-
     def forward(self, x, time, cond: Tensor = None, phys_signal: Tensor = None, x_self_cond = None):
         """
         条件去噪前向过程（基于 Class Token 的异构条件联合嵌入）。
@@ -939,15 +933,7 @@ class PhysiNet(Module):
 
         # 8) 投影得到 x_out（输出投影层 proj_Q）
         x_out = self.proj_Q(c_it)
-
-        # 9) 工况回归分支（全局平均池化 & 线性预测头 → TSTR 辅助任务）
-        if self.cond_predictor is not None:
-            global_feat = c_it.mean(dim=-1)          # (B, init_dim)
-            pred_cond = self.cond_predictor(global_feat)  # (B, cond_dim)
-        else:
-            pred_cond = None
-
-        return x_out, pred_cond
+        return x_out
 
 # -----------------------------------------------------------------------------
 # gaussian diffusion trainer class
@@ -1429,9 +1415,8 @@ class GaussianDiffusion1D(Module):
 
         model_output = self.model(x, t, **model_forward_kwargs)
 
-        # PhysiNet returns (signal_output, pred_cond) tuple; unwrap if so
         if isinstance(model_output, tuple):
-            model_output, _ = model_output
+            model_output = model_output[0]
 
         maybe_clip = partial(torch.clamp, min = -1., max = 1.) if clip_x_start else identity
 
@@ -1619,10 +1604,8 @@ class GaussianDiffusion1D(Module):
 
         model_out = self.model(x, t, **model_forward_kwargs)
 
-        # Unpack (signal_output, pred_cond) tuple returned by PhysiNet
-        pred_cond = None
         if isinstance(model_out, tuple):
-            model_out, pred_cond = model_out
+            model_out = model_out[0]
 
         #训练过程预测不同目标
         if self.objective == 'pred_noise':
