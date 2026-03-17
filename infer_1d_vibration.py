@@ -2,7 +2,7 @@ import os
 import glob
 import numpy as np
 import torch
-from scipy.io import loadmat
+from collections import OrderedDict
 
 from denoising_diffusion_pytorch.denoising_diffusion_pytorch_1d import (
     PhysiNet,
@@ -64,20 +64,37 @@ def build_model_and_diffusion(seq_length: int, channels: int, cond_dim: int = 2)
     return diffusion
 
 
+def _strip_module_prefix(state_dict: dict) -> dict:
+    """若 checkpoint 由 accelerate/DDP 保存，去除 'module.' 前缀。"""
+    new_dict = OrderedDict()
+    for k, v in state_dict.items():
+        name = k[7:] if k.startswith("module.") else k
+        new_dict[name] = v
+    return new_dict
+
+
 def load_trained_diffusion_from_checkpoint(
     ckpt_path: str,
     diffusion: GaussianDiffusion1D,
 ) -> GaussianDiffusion1D:
     """
     从训练保存的 model-*.pt 中加载 GaussianDiffusion1D 权重。
-    注意：这里直接使用训练好的扩散模型进行采样，
-    与 train_1d_vibration.py 结束时调用 diffusion.sample 的行为保持一致。
+    支持 accelerate 保存的 checkpoint（可能带 module. 前缀）。
     """
     device = next(diffusion.parameters()).device
 
     data = torch.load(ckpt_path, map_location=device, weights_only=False)
+    state_dict = data["model"]
 
-    diffusion.load_state_dict(data["model"])
+    # 兼容 accelerate  wrapped model
+    state_dict = _strip_module_prefix(state_dict)
+
+    missing, unexpected = diffusion.load_state_dict(state_dict, strict=False)
+    if missing:
+        print(f"Warning: missing keys when loading: {missing[:5]}{'...' if len(missing) > 5 else ''}")
+    if unexpected:
+        print(f"Warning: unexpected keys when loading: {unexpected[:5]}{'...' if len(unexpected) > 5 else ''}")
+
     diffusion.eval()
     return diffusion
 
@@ -140,20 +157,29 @@ def main():
     # 与训练脚本保持一致的超参数和数据路径
     SEQ_LENGTH = 1024
     CHANNELS = 1
-    COND_DIM = 2  # RPM、Load
+    COND_DIM = 2  # RPM、Load；与 train_1d_vibration.py 中 use_condition=True 时一致
     RESULTS_FOLDER = "./results_vibration"
-    # # 训练数据集路径，用于获取归一化参数（如果检查点中没有保存）
-    # TRAIN_DATA_PATH = r'D:\speedLoad'
+    # 可选：直接指定 checkpoint 路径，若为 None 则从 RESULTS_FOLDER 中查找最新的 model-*.pt
+    CKPT_PATH_OVERRIDE = None  # 例如: r"./results_vibration/model-20.pt"
     
-    # 条件生成的目标值（可以修改）
+    # 条件生成的目标值（可修改）
     TARGET_RPM = 2000.0
     TARGET_LOAD = 40.0  # 可选值: 0, 20, 40, 60
+    
+    # 故障类型 key，用于生成 phys_signal 物理先验；与训练数据目录名一致（如 IF0.2）
+    # 设为 None 或 "NC" 则不使用 phys_signal
+    FAULT_KEY = "IF0.2"
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device for inference: {device}")
 
-    # 1) 找到最新的 checkpoint
-    ckpt_path = find_latest_checkpoint(RESULTS_FOLDER)
+    # 1) 找到或指定 checkpoint
+    if CKPT_PATH_OVERRIDE:
+        if not os.path.isfile(CKPT_PATH_OVERRIDE):
+            raise FileNotFoundError(f"Checkpoint not found: {CKPT_PATH_OVERRIDE}")
+        ckpt_path = CKPT_PATH_OVERRIDE
+    else:
+        ckpt_path = find_latest_checkpoint(RESULTS_FOLDER)
     print(f"Loading checkpoint: {ckpt_path}")
 
     # 2) 构建模型与扩散对象（支持条件生成）
@@ -164,12 +190,12 @@ def main():
     diffusion = load_trained_diffusion_from_checkpoint(ckpt_path, diffusion)
 
     # 4) 获取归一化参数，用于反归一化
-    # 首先尝试从检查点加载，如果失败则从训练数据集计算
     signal_min, signal_max = load_normalization_params_from_checkpoint(ckpt_path)
-    # if signal_min is None or signal_max is None:
-    #     print("Normalization params not found in checkpoint, computing from training dataset...")
-    #     signal_min, signal_max = compute_signal_min_max_from_dataset(TRAIN_DATA_PATH)
-    print(f"Signal normalization params: min={signal_min:.4f}, max={signal_max:.4f}")
+    if signal_min is None or signal_max is None:
+        signal_min, signal_max = -1.0, 1.0
+        print("Normalization params not in checkpoint, using identity denorm (output stays in [-1,1]).")
+    else:
+        print(f"Signal normalization params: min={signal_min:.4f}, max={signal_max:.4f}")
 
     # 5) 使用训练好的扩散模型进行条件采样生成信号
     num_samples = 64
@@ -188,11 +214,29 @@ def main():
     )
     print(f"Normalized conditions: RPM={target_norm_rpm:.4f}, Load={target_norm_load:.4f}")
 
+    # 构造 model_forward_kwargs：cond（有条件时）、phys_signal（可选）
+    model_kwargs = {}
+    if COND_DIM > 0:
+        model_kwargs["cond"] = cond_batch
+    if COND_DIM > 0 and FAULT_KEY and FAULT_KEY != "NC":
+        try:
+            import Bearing
+            if FAULT_KEY in Bearing.FAULT_TYPE_MAP:
+                phys_at_target = Bearing.main(
+                    fault_key=FAULT_KEY, rpm=TARGET_RPM, no_plot=True, target_len=SEQ_LENGTH
+                )
+                phys_t = torch.from_numpy(phys_at_target).float().to(device).unsqueeze(0).unsqueeze(0)
+                phys_t = phys_t.expand(num_samples, -1, -1)
+                model_kwargs["phys_signal"] = phys_t
+                print(f"Using phys_signal for fault_key={FAULT_KEY}, RPM={TARGET_RPM}")
+        except Exception as e:
+            print(f"Warning: Could not generate phys_signal ({e}), sampling without phys_signal.")
+
     with torch.no_grad():
-        # 条件采样
+        # 条件采样（支持 cond + phys_signal）
         sampled = diffusion.sample(
             batch_size=num_samples,
-            model_forward_kwargs={"cond": cond_batch}
+            model_forward_kwargs=model_kwargs,
         )  # (N, C, L)
 
     # 保存原始生成样本（反归一化）到 generated_samples_infer_raw
