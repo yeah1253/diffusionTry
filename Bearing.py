@@ -225,7 +225,7 @@ def main(fault_key: str = None, rpm: float = 900.0, no_plot: bool = False, targe
     if fault_type not in {'ball', 'outer', 'inner'}:
         raise ValueError("fault_type must be one of: 'ball', 'outer', 'inner'")
 
-    tspan1 = 1e-5
+    tspan1 = 1/25600
     tspan = np.arange(0, 2 + tspan1, tspan1)
 
     y0 = [1e-6, 0, 1e-6, 0, 1e-6, 0, 1e-6, 0]

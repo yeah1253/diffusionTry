@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import glob
 import os
+import re
 from typing import Tuple, Optional, List
 
 import numpy as np
@@ -149,6 +150,103 @@ class BearingSignalDataset(Dataset):
             labels=torch.from_numpy(labels),
         )
 
+    @classmethod
+    def from_class_folders_with_subsample(
+        cls,
+        root_dir: str,
+        class_names: Optional[List[str]] = None,
+        max_per_class: Optional[int] = None,
+        max_per_group: Optional[int] = None,
+        seed: int = 42,
+    ) -> "BearingSignalDataset":
+        """
+        从按类别分文件夹加载，支持按类或按组抽样以控制样本量。
+
+        文件名若含 "RPM Load" 模式（如 "xxx 1000 0.npy"），则按组抽样；
+        否则仅按类抽样。
+
+        参数
+        ----
+        root_dir : str
+            根目录路径。
+        class_names : list[str] | None
+            类别名称列表。
+        max_per_class : int | None
+            每类最多保留样本数，None 表示不限制。
+        max_per_group : int | None
+            每个 (RPM, Load) 组最多保留样本数，None 表示不限制。
+        seed : int
+            随机种子。
+        """
+        rng = np.random.default_rng(seed)
+        if class_names is None:
+            class_names = sorted(
+                d for d in os.listdir(root_dir)
+                if os.path.isdir(os.path.join(root_dir, d))
+            )
+
+        # 匹配文件名中的 "数字 数字" 作为 (rpm, load)，如 "IF0.2 1000 0.npy"
+        group_pattern = re.compile(r"(\d+)\s+(\d+)(?:\D|$)")
+
+        all_signals: list[np.ndarray] = []
+        all_labels: list[int] = []
+
+        for label_idx, cname in enumerate(class_names):
+            folder = os.path.join(root_dir, cname)
+            files_by_group: dict[tuple[int, int], list[tuple[str, np.ndarray]]] = {}
+            ungrouped: list[tuple[str, np.ndarray]] = []
+
+            for fname in sorted(os.listdir(folder)):
+                if not fname.endswith(".npy"):
+                    continue
+                fp = os.path.join(folder, fname)
+                sig = np.load(fp).astype(np.float32)
+                if sig.ndim == 1:
+                    sig = sig[np.newaxis, :]
+                elif sig.ndim == 2 and sig.shape[0] != 1:
+                    sig = sig[:1, :]
+                m = group_pattern.search(fname)
+                if m and max_per_group is not None:
+                    rpm, load = int(m.group(1)), int(m.group(2))
+                    key = (rpm, load)
+                    if key not in files_by_group:
+                        files_by_group[key] = []
+                    files_by_group[key].append((fname, sig))
+                else:
+                    ungrouped.append((fname, sig))
+
+            # 抽样：优先按组，再按类
+            collected: list[np.ndarray] = []
+            if max_per_group is not None and files_by_group:
+                for lst in files_by_group.values():
+                    rng.shuffle(lst)
+                    for _, sig in lst[:max_per_group]:
+                        collected.append(sig)
+                for _, sig in ungrouped:
+                    collected.append(sig)
+            else:
+                for grp in files_by_group.values():
+                    for _, sig in grp:
+                        collected.append(sig)
+                for _, sig in ungrouped:
+                    collected.append(sig)
+            if max_per_class is not None and len(collected) > max_per_class:
+                rng.shuffle(collected)
+                collected = collected[:max_per_class]
+            for sig in collected:
+                all_signals.append(sig)
+                all_labels.append(label_idx)
+
+        if not all_signals:
+            raise FileNotFoundError(f"No .npy files found under {root_dir}")
+
+        signals = np.stack(all_signals, axis=0)
+        labels = np.array(all_labels, dtype=np.int64)
+        return cls(
+            signals=torch.from_numpy(signals),
+            labels=torch.from_numpy(labels),
+        )
+
 
 # ---------------------------------------------------------------------------
 # 从路径加载真实/生成数据（用于 infer 生成结果的评估）
@@ -198,6 +296,49 @@ def load_from_flat_folder(
     )
 
 
+def _load_gen_from_root_or_flat(
+    gen_folder: str,
+    class_names: List[str],
+    gen_label: int,
+    max_per_class: Optional[int] = None,
+    seed: int = 42,
+) -> "BearingSignalDataset":
+    """
+    从生成数据目录加载。若 gen_folder 下有与 class_names 同名的子文件夹，
+    则按类加载；否则视为扁平目录，所有样本标为 gen_label。
+    """
+    rng = np.random.default_rng(seed)
+    subdirs = [d for d in os.listdir(gen_folder) if os.path.isdir(os.path.join(gen_folder, d))]
+    npy_in_root = len(glob.glob(os.path.join(gen_folder, "*.npy")))
+
+    all_sigs, all_lbls = [], []
+    if subdirs and npy_in_root == 0:
+        for label_idx, cname in enumerate(class_names):
+            subpath = os.path.join(gen_folder, cname)
+            if not os.path.isdir(subpath):
+                continue
+            paths = sorted(glob.glob(os.path.join(subpath, "*.npy")))
+            sigs_here = []
+            for fp in paths:
+                sig = np.load(fp).astype(np.float32)
+                if sig.ndim == 1:
+                    sig = sig[np.newaxis, :]
+                elif sig.ndim == 2 and sig.shape[0] != 1:
+                    sig = sig[:1, :]
+                sigs_here.append(sig)
+            if max_per_class is not None and len(sigs_here) > max_per_class:
+                rng.shuffle(sigs_here)
+                sigs_here = sigs_here[:max_per_class]
+            all_sigs.extend(sigs_here)
+            all_lbls.extend([label_idx] * len(sigs_here))
+    if all_sigs:
+        signals = np.stack(all_sigs, axis=0)
+        labels = np.array(all_lbls, dtype=np.int64)
+        return BearingSignalDataset(torch.from_numpy(signals), torch.from_numpy(labels))
+    # Fallback: flat folder, single label
+    return load_from_flat_folder(gen_folder, gen_label)
+
+
 def load_real_and_gen_for_eval(
     real_data_path: str,
     gen_data_folder: str,
@@ -205,6 +346,8 @@ def load_real_and_gen_for_eval(
     train_ratio: float = 0.7,
     seed: int = 42,
     class_names: Optional[List[str]] = None,
+    max_per_class: Optional[int] = None,
+    max_per_group: Optional[int] = None,
 ) -> Tuple["BearingSignalDataset", "BearingSignalDataset", "BearingSignalDataset", int, List[str]]:
     """
     加载真实数据与生成数据，并按 train_ratio 划分真实数据为 train/test。
@@ -233,10 +376,21 @@ def load_real_and_gen_for_eval(
     npy_in_root = len(glob.glob(os.path.join(real_data_path, "*.npy")))
 
     if subdirs and not npy_in_root:
-        # 按类别分文件夹
+        # 按类别分文件夹（支持抽样）
         if class_names is None:
             class_names = sorted(subdirs)
-        real_full = BearingSignalDataset.from_class_folders(real_data_path, class_names=class_names)
+        if max_per_class is not None or max_per_group is not None:
+            real_full = BearingSignalDataset.from_class_folders_with_subsample(
+                real_data_path,
+                class_names=class_names,
+                max_per_class=max_per_class,
+                max_per_group=max_per_group,
+                seed=seed,
+            )
+        else:
+            real_full = BearingSignalDataset.from_class_folders(
+                real_data_path, class_names=class_names
+            )
         num_classes = len(class_names)
     else:
         # 扁平单文件夹，单类别
@@ -250,6 +404,9 @@ def load_real_and_gen_for_eval(
             all_sigs.append(sig)
         if not all_sigs:
             raise FileNotFoundError(f"No .npy files in {real_data_path}")
+        if max_per_class is not None and len(all_sigs) > max_per_class:
+            rng.shuffle(all_sigs)
+            all_sigs = all_sigs[:max_per_class]
         signals = np.stack(all_sigs, axis=0)
         labels = np.zeros(len(all_sigs), dtype=np.int64)
         real_full = BearingSignalDataset(torch.from_numpy(signals), torch.from_numpy(labels))
@@ -291,8 +448,11 @@ def load_real_and_gen_for_eval(
         torch.from_numpy(real_test_sig), torch.from_numpy(real_test_lbl)
     )
 
-    # 加载生成数据
-    gen_train = load_from_flat_folder(gen_data_folder, label=gen_label)
+    # 加载生成数据（支持按类子目录或扁平目录）
+    gen_train = _load_gen_from_root_or_flat(
+        gen_data_folder, class_names, gen_label,
+        max_per_class=max_per_class, seed=seed,
+    )
 
     return real_train, gen_train, real_test, num_classes, class_names
 

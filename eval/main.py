@@ -30,10 +30,17 @@ import torch
 import matplotlib
 # 若无 GUI，使用非交互后端
 matplotlib.use("Agg")
+# 配置中文字体，消除 "Glyph missing from font" 警告（Windows 常用 SimHei/微软雅黑）
+import matplotlib.pyplot as _plt
+_plt.rcParams["font.sans-serif"] = ["SimHei", "Microsoft YaHei", "SimSun", "DejaVu Sans"]
+_plt.rcParams["axes.unicode_minus"] = False  # 负号显示
+import warnings
+warnings.filterwarnings("ignore", message=".*Glyph.*missing.*")
 
 from eval.dataset import make_dummy_datasets, load_real_and_gen_for_eval, load_gen_only_for_eval
 from eval.eval_time_freq import run_time_freq_analysis
 from eval.train_diagnosis import run_trtr_tstr
+from eval.train_diagnosis_simple import run_trtr_tstr_simple
 from eval.visualize_tsne import run_tsne_visualization
 
 
@@ -45,19 +52,26 @@ def main() -> None:
     SEQ_LENGTH = 1024         # 信号长度（需与 infer/train 一致）
     FS = 25600.0              # 采样率 (Hz)
     TRAIN_RATIO = 0.7         # 真实数据 train/test 划分比例
-    NUM_EPOCHS = 30           # 分类器训练轮数
-    BATCH_SIZE = 32           # 批大小
-    LR = 1e-3                 # 学习率
+    NUM_EPOCHS = 30           # CNN 分类器训练轮数（USE_SIMPLE_CLASSIFIER=False 时用）
+    BATCH_SIZE = 32            # CNN 批大小
+    LR = 1e-3                  # CNN 学习率
     LOW_FREQ_LIMIT = 1000.0   # 频谱低频聚焦上界 (Hz)
-    SAVE_DIR = "./eval_results"  # 结果保存目录
+
+    # ---------- 下游分类器选择 ----------
+    USE_SIMPLE_CLASSIFIER = True   # True: 手工特征+RandomForest；False: 1D-CNN
+    MAX_SAMPLES_PER_CLASS = 500    # 每类最多样本数，控制单故障样本过多
+    MAX_SAMPLES_PER_GROUP = 50     # 每组(RPM,Load)最多样本数，None 则不按组限
+    # 项目根目录（与 eval 文件夹同级，generated_samples_infer 所在位置）
+    _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    SAVE_DIR = os.path.join(_PROJECT_ROOT, "eval_results")  # 结果保存目录
 
     # ---------- 数据来源模式 ----------
     USE_REAL_DATA = True      # True: 使用真实+生成数据；False: Dummy 冒烟测试
     USE_GEN_ONLY = False      # 仅生成数据模式（无真实数据时自动启用）
-    REAL_DATA_PATH = r"D:\data\轴承数据集\IF0.2"  # 真实数据路径
-    GEN_DATA_FOLDER = "./generated_samples_infer"  # infer 生成数据目录
+    REAL_DATA_PATH = r"D:\data\轴承数据集"  # 10 类：根目录（含 NC/IF0.2/...）；单类：如 .../IF0.2
+    GEN_DATA_FOLDER = os.path.join(_PROJECT_ROOT, "generated_samples_infer")  # 固定为项目根下的 generated_samples_infer
     GEN_LABEL = 0             # 生成数据对应类别标签（单类为 0）
-    CLASS_NAMES = None        # 多类别时显式指定，如 ["NC", "IF0.2", "OF0.2"]
+    CLASS_NAMES = None        # 10 类时可设为 ["NC","IF0.2",...,"RF0.6"]，None 则按文件夹自动推断
     NUM_CLASSES_DUMMY = 4
     SAMPLES_PER_CLASS_DUMMY = 80
 
@@ -119,6 +133,8 @@ def main() -> None:
             train_ratio=TRAIN_RATIO,
             seed=42,
             class_names=CLASS_NAMES,
+            max_per_class=MAX_SAMPLES_PER_CLASS,
+            max_per_group=MAX_SAMPLES_PER_GROUP,
         )
     else:
         real_train, gen_train, real_test = make_dummy_datasets(
@@ -163,16 +179,26 @@ def main() -> None:
     print("[3] 运行模块二：TRTR / TSTR 下游分类对比...")
     t0 = time.time()
 
-    results = run_trtr_tstr(
-        real_train=real_train,
-        gen_train=gen_train,
-        real_test=real_test,
-        num_classes=NUM_CLASSES,
-        num_epochs=NUM_EPOCHS,
-        batch_size=BATCH_SIZE,
-        lr=LR,
-        device=device,
-    )
+    if USE_SIMPLE_CLASSIFIER:
+        results = run_trtr_tstr_simple(
+            real_train=real_train,
+            gen_train=gen_train,
+            real_test=real_test,
+            num_classes=NUM_CLASSES,
+            class_names=class_names,
+            classifier="rf",
+        )
+    else:
+        results = run_trtr_tstr(
+            real_train=real_train,
+            gen_train=gen_train,
+            real_test=real_test,
+            num_classes=NUM_CLASSES,
+            num_epochs=NUM_EPOCHS,
+            batch_size=BATCH_SIZE,
+            lr=LR,
+            device=device,
+        )
     print(f"  模块二耗时: {time.time() - t0:.2f}s\n")
 
     # =====================================================================
