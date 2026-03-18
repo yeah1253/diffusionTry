@@ -319,11 +319,11 @@ if __name__ == '__main__':
         dataset = dataset,
         train_batch_size = 48,        # 调整为48，避免显存不足 (dim=128模型更大)
         train_lr = 4e-5,              # 降低学习率提升训练稳定性
-        train_num_steps = 30000,      # 约125个epoch，足够收敛
+        train_num_steps = 3000,      # 约125个epoch，足够收敛
         gradient_accumulate_every = 2, # 梯度累积，有效batch=96
         ema_decay = 0.9995,           # 较高的EMA衰减率
         amp = True,                   # 启用AMP加速训练
-        save_and_sample_every = 1500, # 每1500步保存一次，共20个checkpoint
+        save_and_sample_every = 150, # 每1500步保存一次，共20个checkpoint
         num_samples = 16,
         results_folder = './results_vibration',
         # 传入归一化参数，会保存到检查点中供推理时使用

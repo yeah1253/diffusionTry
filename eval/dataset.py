@@ -14,6 +14,7 @@ dataset.py — 数据集加载与管理模块
 
 from __future__ import annotations
 
+import glob
 import os
 from typing import Tuple, Optional, List
 
@@ -147,6 +148,199 @@ class BearingSignalDataset(Dataset):
             signals=torch.from_numpy(signals),
             labels=torch.from_numpy(labels),
         )
+
+
+# ---------------------------------------------------------------------------
+# 从路径加载真实/生成数据（用于 infer 生成结果的评估）
+# ---------------------------------------------------------------------------
+
+def load_from_flat_folder(
+    folder: str,
+    label: int,
+    pattern: str = "*.npy",
+) -> "BearingSignalDataset":
+    """
+    从扁平目录加载所有 .npy 文件，统一指定一个类别标签。
+
+    用于加载 generated_samples_infer 等单类别生成数据。
+
+    参数
+    ----
+    folder : str
+        目录路径（如 ./generated_samples_infer）。
+    label : int
+        所有样本的类别标签。
+    pattern : str
+        文件名匹配模式，默认 *.npy。
+
+    返回
+    ----
+    BearingSignalDataset
+    """
+    paths = sorted(glob.glob(os.path.join(folder, pattern)))
+    if not paths:
+        raise FileNotFoundError(f"No .npy files found in {folder}")
+
+    all_signals: list[np.ndarray] = []
+    for fp in paths:
+        sig = np.load(fp).astype(np.float32)
+        if sig.ndim == 1:
+            sig = sig[np.newaxis, :]       # (L,) -> (1, L)
+        elif sig.ndim == 2 and sig.shape[0] != 1:
+            sig = sig[:1, :]
+        all_signals.append(sig)
+
+    signals = np.stack(all_signals, axis=0)   # (N, 1, L)
+    labels = np.full(len(all_signals), label, dtype=np.int64)
+    return BearingSignalDataset(
+        signals=torch.from_numpy(signals),
+        labels=torch.from_numpy(labels),
+    )
+
+
+def load_real_and_gen_for_eval(
+    real_data_path: str,
+    gen_data_folder: str,
+    gen_label: int,
+    train_ratio: float = 0.7,
+    seed: int = 42,
+    class_names: Optional[List[str]] = None,
+) -> Tuple["BearingSignalDataset", "BearingSignalDataset", "BearingSignalDataset", int, List[str]]:
+    """
+    加载真实数据与生成数据，并按 train_ratio 划分真实数据为 train/test。
+
+    真实数据支持两种结构：
+      1) 按类别分文件夹：real_data_path/IF0.2/*.npy, real_data_path/OF0.2/*.npy ...
+      2) 扁平单文件夹：real_data_path/*.npy（全部视为同一类别）
+
+    生成数据：gen_data_folder 下所有 .npy，统一标签为 gen_label。
+
+    返回
+    ----
+    real_train, gen_train, real_test : BearingSignalDataset
+    num_classes : int
+        总类别数（由真实数据推断，gen_label 必须在 [0, num_classes-1] 内）
+    class_names : List[str]
+        类别名称列表
+    """
+    rng = np.random.default_rng(seed)
+
+    # 判断真实数据结构
+    subdirs = [
+        d for d in os.listdir(real_data_path)
+        if os.path.isdir(os.path.join(real_data_path, d))
+    ]
+    npy_in_root = len(glob.glob(os.path.join(real_data_path, "*.npy")))
+
+    if subdirs and not npy_in_root:
+        # 按类别分文件夹
+        if class_names is None:
+            class_names = sorted(subdirs)
+        real_full = BearingSignalDataset.from_class_folders(real_data_path, class_names=class_names)
+        num_classes = len(class_names)
+    else:
+        # 扁平单文件夹，单类别
+        all_sigs = []
+        for fp in sorted(glob.glob(os.path.join(real_data_path, "*.npy"))):
+            sig = np.load(fp).astype(np.float32)
+            if sig.ndim == 1:
+                sig = sig[np.newaxis, :]
+            elif sig.ndim == 2 and sig.shape[0] != 1:
+                sig = sig[:1, :]
+            all_sigs.append(sig)
+        if not all_sigs:
+            raise FileNotFoundError(f"No .npy files in {real_data_path}")
+        signals = np.stack(all_sigs, axis=0)
+        labels = np.zeros(len(all_sigs), dtype=np.int64)
+        real_full = BearingSignalDataset(torch.from_numpy(signals), torch.from_numpy(labels))
+        num_classes = 1
+        class_names = ["类别0"] if class_names is None else class_names
+
+    # 确保 gen_label 有效
+    if gen_label < 0 or gen_label >= num_classes:
+        gen_label = 0
+        if num_classes > 1:
+            print(f"Warning: gen_label 超出范围，已设为 0")
+
+    # 分层划分 real -> train / test
+    train_sigs, train_lbls = [], []
+    test_sigs, test_lbls = [], []
+    for c in range(num_classes):
+        mask = real_full.labels.numpy() == c
+        idx = np.where(mask)[0]
+        rng.shuffle(idx)
+        n_train = max(1, int(len(idx) * train_ratio))
+        n_test = len(idx) - n_train
+        if n_test < 1:
+            n_train -= 1
+            n_test = 1
+        train_sigs.append(real_full.signals.numpy()[idx[:n_train]])
+        train_lbls.append(real_full.labels.numpy()[idx[:n_train]])
+        test_sigs.append(real_full.signals.numpy()[idx[n_train:]])
+        test_lbls.append(real_full.labels.numpy()[idx[n_train:]])
+
+    real_train_sig = np.concatenate(train_sigs, axis=0)
+    real_train_lbl = np.concatenate(train_lbls, axis=0)
+    real_test_sig = np.concatenate(test_sigs, axis=0)
+    real_test_lbl = np.concatenate(test_lbls, axis=0)
+
+    real_train = BearingSignalDataset(
+        torch.from_numpy(real_train_sig), torch.from_numpy(real_train_lbl)
+    )
+    real_test = BearingSignalDataset(
+        torch.from_numpy(real_test_sig), torch.from_numpy(real_test_lbl)
+    )
+
+    # 加载生成数据
+    gen_train = load_from_flat_folder(gen_data_folder, label=gen_label)
+
+    return real_train, gen_train, real_test, num_classes, class_names
+
+
+def load_gen_only_for_eval(
+    gen_data_folder: str,
+    train_ratio: float = 0.5,
+    seed: int = 42,
+) -> Tuple["BearingSignalDataset", "BearingSignalDataset", "BearingSignalDataset", int, List[str]]:
+    """
+    仅从生成数据目录加载，将其划分为「参考真实」(前一半) 与「生成」(后一半)，
+    用于仅有 generated_samples_infer 时的时频对比与 t-SNE。
+    TRTR/TSTR 将退化为单类（准确率恒为 1.0）。
+
+    返回
+    ----
+    real_train, gen_train, real_test : 前一半作为 real，后一半作为 gen
+    num_classes : 1
+    class_names : ["生成信号"]
+    """
+    rng = np.random.default_rng(seed)
+    gen_full = load_from_flat_folder(gen_data_folder, label=0)
+    n = len(gen_full)
+    if n < 4:
+        raise ValueError(f"生成数据至少需 4 条，当前仅 {n} 条")
+    idx = np.arange(n)
+    rng.shuffle(idx)
+    n_real = n // 2
+    real_idx = idx[:n_real]
+    gen_idx = idx[n_real:]
+
+    real_sigs = gen_full.signals.numpy()[real_idx]
+    real_lbls = gen_full.labels.numpy()[real_idx]
+    gen_sigs = gen_full.signals.numpy()[gen_idx]
+    gen_lbls = gen_full.labels.numpy()[gen_idx]
+
+    n_real_train = max(1, int(n_real * train_ratio))
+    real_train = BearingSignalDataset(
+        torch.from_numpy(real_sigs[:n_real_train]),
+        torch.from_numpy(real_lbls[:n_real_train]),
+    )
+    real_test = BearingSignalDataset(
+        torch.from_numpy(real_sigs[n_real_train:]),
+        torch.from_numpy(real_lbls[n_real_train:]),
+    )
+    gen_train = BearingSignalDataset(torch.from_numpy(gen_sigs), torch.from_numpy(gen_lbls))
+
+    return real_train, gen_train, real_test, 1, ["生成信号"]
 
 
 # ---------------------------------------------------------------------------
