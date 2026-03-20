@@ -24,6 +24,54 @@ from .models import BearingCNN1D
 
 
 # ---------------------------------------------------------------------------
+# KL 散度（量化真实/生成分布差异）
+# ---------------------------------------------------------------------------
+
+def compute_kl_divergence(
+    real_feats: np.ndarray,
+    gen_feats: np.ndarray,
+    eps: float = 1e-6,
+) -> dict:
+    """
+    在特征空间假设多元高斯分布，计算真实数据与生成数据的 KL 散度。
+
+    KL(P||Q) 衡量用 Q 近似 P 时的信息损失；KL 不对称。
+    JS 为对称度量，取值 [0, log2]，0 表示分布相同。
+
+    参数
+    ----
+    real_feats : np.ndarray, shape (N, D)
+    gen_feats  : np.ndarray, shape (M, D)
+    eps : float
+        协方差正则化，避免奇异矩阵。
+
+    返回
+    ----
+    dict : {"kl_real_gen", "kl_gen_real", "js"}
+    """
+    mu_r = np.mean(real_feats, axis=0)
+    mu_g = np.mean(gen_feats, axis=0)
+    S_r = np.cov(real_feats.T) + eps * np.eye(real_feats.shape[1])
+    S_g = np.cov(gen_feats.T) + eps * np.eye(gen_feats.shape[1])
+    k = real_feats.shape[1]
+
+    def kl_gaussian(mu1, S1, mu2, S2):
+        """KL(N(mu1,S1) || N(mu2,S2))"""
+        Sinv2 = np.linalg.inv(S2)
+        diff = mu1 - mu2
+        tr_term = np.trace(Sinv2 @ S1)
+        quad_term = diff @ Sinv2 @ diff
+        log_term = np.log(np.linalg.det(S2) / np.linalg.det(S1) + 1e-10)
+        return 0.5 * (tr_term + quad_term - k + log_term)
+
+    kl_rg = kl_gaussian(mu_r, S_r, mu_g, S_g)
+    kl_gr = kl_gaussian(mu_g, S_g, mu_r, S_r)
+    js = 0.5 * (kl_rg + kl_gr)
+
+    return {"kl_real_gen": float(kl_rg), "kl_gen_real": float(kl_gr), "js": float(js)}
+
+
+# ---------------------------------------------------------------------------
 # 特征提取
 # ---------------------------------------------------------------------------
 
@@ -244,9 +292,9 @@ def run_tsne_visualization(
     class_names: Optional[List[str]] = None,
     save_path: Optional[str] = None,
     use_raw_features: bool = False,
-) -> None:
+) -> dict:
     """
-    一键运行 t-SNE 可视化。
+    一键运行 t-SNE 可视化，并计算真实/生成数据的 KL 散度。
 
     参数
     ----
@@ -261,6 +309,10 @@ def run_tsne_visualization(
     save_path : str | None
     use_raw_features : bool
         是否直接从原始信号提取特征（不使用 CNN）。
+
+    返回
+    ----
+    dict : {"kl_real_gen", "kl_gen_real", "js"} 用于量化分布差异
     """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -298,8 +350,15 @@ def run_tsne_visualization(
     print(f"  真实数据样本数: {len(real_dataset)}")
     print(f"  生成数据样本数: {len(gen_dataset)}")
     print(f"  特征维度: {features.shape[1]}")
-    print(f"  正在运行 t-SNE...")
 
+    # KL 散度（量化分布差异）
+    kl_result = compute_kl_divergence(real_feats, gen_feats)
+    print(f"\n  [KL 散度] 真实 vs 生成 分布差异（特征空间，高斯假设）:")
+    print(f"    KL(真实||生成): {kl_result['kl_real_gen']:.4f}")
+    print(f"    KL(生成||真实): {kl_result['kl_gen_real']:.4f}")
+    print(f"    Jensen-Shannon: {kl_result['js']:.4f}  (对称，0=相同)")
+
+    print(f"\n  正在运行 t-SNE...")
     plot_tsne(
         features, labels, source_tags,
         class_names=class_names,
@@ -307,6 +366,7 @@ def run_tsne_visualization(
     )
 
     print("  t-SNE 可视化完成！\n")
+    return kl_result
 
 
 

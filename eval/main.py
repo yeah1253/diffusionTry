@@ -70,6 +70,8 @@ def main() -> None:
             seed=42,
             max_per_class=MAX_SAMPLES_PER_CLASS,
             max_per_group=MAX_SAMPLES_PER_GROUP,
+            seq_length=SEQ_LENGTH,
+            overlap=0.5,
         )
     else:
         real_train, gen_train, real_test = make_dummy_datasets(
@@ -141,8 +143,8 @@ def main() -> None:
 
     tsne_save_path = os.path.join(SAVE_DIR, "tsne_visualization.png")
 
-    # 使用原始信号统计特征进行 t-SNE（无需预训练模型）
-    run_tsne_visualization(
+    # t-SNE 可视化 + KL 散度（量化真实/生成分布差异）
+    kl_result = run_tsne_visualization(
         model=None,
         real_dataset=real_train,
         gen_dataset=gen_train,
@@ -151,6 +153,14 @@ def main() -> None:
         save_path=tsne_save_path,
         use_raw_features=True,
     )
+    # 保存 KL 结果到文件
+    kl_path = os.path.join(SAVE_DIR, "kl_divergence.txt")
+    with open(kl_path, "w", encoding="utf-8") as f:
+        f.write("KL 散度 (特征空间，高斯假设)\n")
+        f.write(f"KL(真实||生成): {kl_result['kl_real_gen']:.6f}\n")
+        f.write(f"KL(生成||真实): {kl_result['kl_gen_real']:.6f}\n")
+        f.write(f"Jensen-Shannon: {kl_result['js']:.6f}\n")
+    print(f"  KL 结果已保存到 {kl_path}")
     print(f"  模块三耗时: {time.time() - t0:.2f}s\n")
 
     # =====================================================================
@@ -161,6 +171,7 @@ def main() -> None:
     print(f"{'═'*60}")
     print(f"  TRTR 准确率: {results['TRTR_acc']:.4f} ({results['TRTR_acc']*100:.2f}%)")
     print(f"  TSTR 准确率: {results['TSTR_acc']:.4f} ({results['TSTR_acc']*100:.2f}%)")
+    print(f"  KL 散度 (JS): {kl_result['js']:.4f}  (0=分布相同)")
     print(f"  结果保存目录: {os.path.abspath(SAVE_DIR)}")
     print(f"\n  生成的文件:")
     for f in sorted(os.listdir(SAVE_DIR)):

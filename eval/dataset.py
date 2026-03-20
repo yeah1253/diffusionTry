@@ -21,8 +21,34 @@ from typing import Tuple, Optional, List
 
 import numpy as np
 import torch
+
+try:
+    from scipy.io import loadmat
+except ImportError:
+    loadmat = None  # type: ignore
 from torch import Tensor
 from torch.utils.data import Dataset, DataLoader
+
+
+# ---------------------------------------------------------------------------
+# .mat 加载辅助（与 train_1d_vibration 一致）
+# ---------------------------------------------------------------------------
+
+def _load_mat_as_samples(
+    mat_path: str,
+    seq_length: int = 1024,
+    overlap: float = 0.5,
+) -> list[np.ndarray]:
+    """从 .mat 加载长序列并分割为 (1, seq_length) 样本。"""
+    if loadmat is None:
+        raise ImportError("scipy 未安装，无法加载 .mat 文件。请运行: pip install scipy")
+    data = loadmat(mat_path)
+    signal = data["Signal"]["y_values"][0, 0]["values"].item()[:, 0].astype(np.float32)
+    step = int(seq_length * (1 - overlap))
+    samples = []
+    for i in range(0, len(signal) - seq_length + 1, step):
+        samples.append(signal[i : i + seq_length][np.newaxis, :])  # (1, L)
+    return samples
 
 
 # ---------------------------------------------------------------------------
@@ -158,25 +184,14 @@ class BearingSignalDataset(Dataset):
         max_per_class: Optional[int] = None,
         max_per_group: Optional[int] = None,
         seed: int = 42,
+        seq_length: int = 1024,
+        overlap: float = 0.5,
     ) -> "BearingSignalDataset":
         """
-        从按类别分文件夹加载，支持按类或按组抽样以控制样本量。
+        从按类别分文件夹加载，支持 .npy 与 .mat，按类或按组抽样。
 
-        文件名若含 "RPM Load" 模式（如 "xxx 1000 0.npy"），则按组抽样；
-        否则仅按类抽样。
-
-        参数
-        ----
-        root_dir : str
-            根目录路径。
-        class_names : list[str] | None
-            类别名称列表。
-        max_per_class : int | None
-            每类最多保留样本数，None 表示不限制。
-        max_per_group : int | None
-            每个 (RPM, Load) 组最多保留样本数，None 表示不限制。
-        seed : int
-            随机种子。
+        支持格式：.npy（单样本）或 .mat（长序列，自动分割为 seq_length 样本）。
+        文件名若含 "RPM Load"（如 "xxx 1000 0.npy"），则按组抽样。
         """
         rng = np.random.default_rng(seed)
         if class_names is None:
@@ -201,28 +216,32 @@ class BearingSignalDataset(Dataset):
             for item in sorted(os.listdir(folder)):
                 subpath = os.path.join(folder, item)
                 if os.path.isdir(subpath):
-                    # 子目录如 "1000 0"：解析为组，加载其内 *.npy
+                    # 子目录如 "1000 0"：解析为组，加载其内 *.npy 或 *.mat
                     m = re.match(r"^(\d+)\s+(\d+)$", item.strip())
-                    if m and max_per_group is not None:
-                        rpm, load = int(m.group(1)), int(m.group(2))
-                        key = (rpm, load)
-                        for fp in sorted(glob.glob(os.path.join(subpath, "*.npy"))):
-                            sig = np.load(fp).astype(np.float32)
-                            if sig.ndim == 1:
-                                sig = sig[np.newaxis, :]
-                            elif sig.ndim == 2 and sig.shape[0] != 1:
-                                sig = sig[:1, :]
-                            if key not in files_by_group:
-                                files_by_group[key] = []
-                            files_by_group[key].append((item, sig))
-                    else:
-                        for fp in sorted(glob.glob(os.path.join(subpath, "*.npy"))):
-                            sig = np.load(fp).astype(np.float32)
-                            if sig.ndim == 1:
-                                sig = sig[np.newaxis, :]
-                            elif sig.ndim == 2 and sig.shape[0] != 1:
-                                sig = sig[:1, :]
+                    grp_key = (int(m.group(1)), int(m.group(2))) if m and max_per_group is not None else None
+                    for fp in sorted(glob.glob(os.path.join(subpath, "*.npy"))):
+                        sig = np.load(fp).astype(np.float32)
+                        if sig.ndim == 1:
+                            sig = sig[np.newaxis, :]
+                        elif sig.ndim == 2 and sig.shape[0] != 1:
+                            sig = sig[:1, :]
+                        if grp_key is not None:
+                            if grp_key not in files_by_group:
+                                files_by_group[grp_key] = []
+                            files_by_group[grp_key].append((item, sig))
+                        else:
                             ungrouped.append((item, sig))
+                    for fp in sorted(glob.glob(os.path.join(subpath, "*.mat"))):
+                        try:
+                            for sig in _load_mat_as_samples(fp, seq_length=seq_length, overlap=overlap):
+                                if grp_key is not None:
+                                    if grp_key not in files_by_group:
+                                        files_by_group[grp_key] = []
+                                    files_by_group[grp_key].append((item, sig))
+                                else:
+                                    ungrouped.append((item, sig))
+                        except Exception:
+                            continue
                 elif item.endswith(".npy"):
                     fp = subpath
                     sig = np.load(fp).astype(np.float32)
@@ -239,6 +258,22 @@ class BearingSignalDataset(Dataset):
                         files_by_group[key].append((item, sig))
                     else:
                         ungrouped.append((item, sig))
+                elif item.endswith(".mat"):
+                    try:
+                        samples = _load_mat_as_samples(subpath, seq_length=seq_length, overlap=overlap)
+                    except Exception:
+                        continue
+                    m = group_pattern.search(item)
+                    if m and max_per_group is not None:
+                        rpm, load = int(m.group(1)), int(m.group(2))
+                        key = (rpm, load)
+                        if key not in files_by_group:
+                            files_by_group[key] = []
+                        for sig in samples:
+                            files_by_group[key].append((item, sig))
+                    else:
+                        for sig in samples:
+                            ungrouped.append((item, sig))
 
             # 抽样：优先按组，再按类
             collected: list[np.ndarray] = []
@@ -263,7 +298,10 @@ class BearingSignalDataset(Dataset):
                 all_labels.append(label_idx)
 
         if not all_signals:
-            raise FileNotFoundError(f"No .npy files found under {root_dir}")
+            raise FileNotFoundError(
+                f"No .npy or .mat files found under {root_dir}. "
+                "真实数据需为 .npy 或 .mat（SDUST 格式），置于各故障子目录内。"
+            )
 
         signals = np.stack(all_signals, axis=0)
         labels = np.array(all_labels, dtype=np.int64)
@@ -329,13 +367,15 @@ def load_real_and_gen_for_eval(
     class_names: Optional[List[str]] = None,
     max_per_class: Optional[int] = None,
     max_per_group: Optional[int] = None,
+    seq_length: int = 1024,
+    overlap: float = 0.5,
 ) -> Tuple["BearingSignalDataset", "BearingSignalDataset", "BearingSignalDataset", int, List[str]]:
     """
     加载真实数据与生成数据，使用相同的 max_per_class、max_per_group 抽样逻辑。
     真实数据按 train_ratio 划分为 train/test；生成数据全部作为 gen_train。
 
-    目录结构（真实与生成一致）：
-      root/IF0.2/*.npy 或 root/IF0.2/1000 0/*.npy
+    目录结构：root/IF0.2/*.npy 或 root/IF0.2/*.mat 或 root/IF0.2/1000 0/*.npy
+    支持 .mat（长序列自动分割为 seq_length 样本）与 .npy。
     """
     if not os.path.isdir(real_data_path):
         raise FileNotFoundError(f"真实数据目录不存在: {real_data_path}")
@@ -354,11 +394,12 @@ def load_real_and_gen_for_eval(
         class_names = sorted(subdirs) if subdirs else ["类别0"]
     num_classes = len(class_names)
 
-    # 统一加载逻辑：from_class_folders_with_subsample
+    # 统一加载逻辑：from_class_folders_with_subsample（支持 .npy 与 .mat）
     def _load(root: str) -> "BearingSignalDataset":
         return BearingSignalDataset.from_class_folders_with_subsample(
             root, class_names=class_names,
             max_per_class=max_per_class, max_per_group=max_per_group, seed=seed,
+            seq_length=seq_length, overlap=overlap,
         )
 
     real_full = _load(real_data_path)
