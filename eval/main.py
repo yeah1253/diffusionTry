@@ -39,14 +39,14 @@ def main() -> None:
     NUM_EPOCHS = 30
     BATCH_SIZE = 32
     LR = 1e-3
-    LOW_FREQ_LIMIT = 1000.0
+    LOW_FREQ_LIMIT = 1000.0 #频谱图横轴上限 (Hz)，只展示 0–1000 Hz，便于观察主要频率
 
     USE_SIMPLE_CLASSIFIER = False
-    MAX_SAMPLES_PER_CLASS = 960
-    MAX_SAMPLES_PER_GROUP = 40
+    MAX_SAMPLES_PER_CLASS = 960 #每个故障类别最多保留的样本数
+    MAX_SAMPLES_PER_GROUP = 40  #每个工况最多保留的样本数(40*24=960)
 
     _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    SAVE_DIR = os.path.join(_PROJECT_ROOT, "eval_results")
+    SAVE_DIR = os.path.join(_PROJECT_ROOT, "eval_results")  #结果生成路径
     REAL_DATA_PATH = r"D:\data\轴承数据集"
     GEN_DATA_FOLDER = os.path.join(_PROJECT_ROOT, "generated_samples_infer")
     USE_REAL_DATA = True
