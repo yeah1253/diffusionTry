@@ -185,7 +185,7 @@ class BearingSignalDataset(Dataset):
                 if os.path.isdir(os.path.join(root_dir, d))
             )
 
-        # 匹配文件名中的 "数字 数字" 作为 (rpm, load)，如 "IF0.2 1000 0.npy"
+        # 匹配 "数字 数字" 作为 (rpm, load)：文件名如 "xxx 1000 0.npy"，或子目录名如 "1000 0"
         group_pattern = re.compile(r"(\d+)\s+(\d+)(?:\D|$)")
 
         all_signals: list[np.ndarray] = []
@@ -193,27 +193,52 @@ class BearingSignalDataset(Dataset):
 
         for label_idx, cname in enumerate(class_names):
             folder = os.path.join(root_dir, cname)
+            if not os.path.isdir(folder):
+                continue
             files_by_group: dict[tuple[int, int], list[tuple[str, np.ndarray]]] = {}
             ungrouped: list[tuple[str, np.ndarray]] = []
 
-            for fname in sorted(os.listdir(folder)):
-                if not fname.endswith(".npy"):
-                    continue
-                fp = os.path.join(folder, fname)
-                sig = np.load(fp).astype(np.float32)
-                if sig.ndim == 1:
-                    sig = sig[np.newaxis, :]
-                elif sig.ndim == 2 and sig.shape[0] != 1:
-                    sig = sig[:1, :]
-                m = group_pattern.search(fname)
-                if m and max_per_group is not None:
-                    rpm, load = int(m.group(1)), int(m.group(2))
-                    key = (rpm, load)
-                    if key not in files_by_group:
-                        files_by_group[key] = []
-                    files_by_group[key].append((fname, sig))
-                else:
-                    ungrouped.append((fname, sig))
+            for item in sorted(os.listdir(folder)):
+                subpath = os.path.join(folder, item)
+                if os.path.isdir(subpath):
+                    # 子目录如 "1000 0"：解析为组，加载其内 *.npy
+                    m = re.match(r"^(\d+)\s+(\d+)$", item.strip())
+                    if m and max_per_group is not None:
+                        rpm, load = int(m.group(1)), int(m.group(2))
+                        key = (rpm, load)
+                        for fp in sorted(glob.glob(os.path.join(subpath, "*.npy"))):
+                            sig = np.load(fp).astype(np.float32)
+                            if sig.ndim == 1:
+                                sig = sig[np.newaxis, :]
+                            elif sig.ndim == 2 and sig.shape[0] != 1:
+                                sig = sig[:1, :]
+                            if key not in files_by_group:
+                                files_by_group[key] = []
+                            files_by_group[key].append((item, sig))
+                    else:
+                        for fp in sorted(glob.glob(os.path.join(subpath, "*.npy"))):
+                            sig = np.load(fp).astype(np.float32)
+                            if sig.ndim == 1:
+                                sig = sig[np.newaxis, :]
+                            elif sig.ndim == 2 and sig.shape[0] != 1:
+                                sig = sig[:1, :]
+                            ungrouped.append((item, sig))
+                elif item.endswith(".npy"):
+                    fp = subpath
+                    sig = np.load(fp).astype(np.float32)
+                    if sig.ndim == 1:
+                        sig = sig[np.newaxis, :]
+                    elif sig.ndim == 2 and sig.shape[0] != 1:
+                        sig = sig[:1, :]
+                    m = group_pattern.search(item)
+                    if m and max_per_group is not None:
+                        rpm, load = int(m.group(1)), int(m.group(2))
+                        key = (rpm, load)
+                        if key not in files_by_group:
+                            files_by_group[key] = []
+                        files_by_group[key].append((item, sig))
+                    else:
+                        ungrouped.append((item, sig))
 
             # 抽样：优先按组，再按类
             collected: list[np.ndarray] = []
@@ -296,53 +321,9 @@ def load_from_flat_folder(
     )
 
 
-def _load_gen_from_root_or_flat(
-    gen_folder: str,
-    class_names: List[str],
-    gen_label: int,
-    max_per_class: Optional[int] = None,
-    seed: int = 42,
-) -> "BearingSignalDataset":
-    """
-    从生成数据目录加载。若 gen_folder 下有与 class_names 同名的子文件夹，
-    则按类加载；否则视为扁平目录，所有样本标为 gen_label。
-    """
-    rng = np.random.default_rng(seed)
-    subdirs = [d for d in os.listdir(gen_folder) if os.path.isdir(os.path.join(gen_folder, d))]
-    npy_in_root = len(glob.glob(os.path.join(gen_folder, "*.npy")))
-
-    all_sigs, all_lbls = [], []
-    if subdirs and npy_in_root == 0:
-        for label_idx, cname in enumerate(class_names):
-            subpath = os.path.join(gen_folder, cname)
-            if not os.path.isdir(subpath):
-                continue
-            paths = sorted(glob.glob(os.path.join(subpath, "*.npy")))
-            sigs_here = []
-            for fp in paths:
-                sig = np.load(fp).astype(np.float32)
-                if sig.ndim == 1:
-                    sig = sig[np.newaxis, :]
-                elif sig.ndim == 2 and sig.shape[0] != 1:
-                    sig = sig[:1, :]
-                sigs_here.append(sig)
-            if max_per_class is not None and len(sigs_here) > max_per_class:
-                rng.shuffle(sigs_here)
-                sigs_here = sigs_here[:max_per_class]
-            all_sigs.extend(sigs_here)
-            all_lbls.extend([label_idx] * len(sigs_here))
-    if all_sigs:
-        signals = np.stack(all_sigs, axis=0)
-        labels = np.array(all_lbls, dtype=np.int64)
-        return BearingSignalDataset(torch.from_numpy(signals), torch.from_numpy(labels))
-    # Fallback: flat folder, single label
-    return load_from_flat_folder(gen_folder, gen_label)
-
-
 def load_real_and_gen_for_eval(
     real_data_path: str,
     gen_data_folder: str,
-    gen_label: int,
     train_ratio: float = 0.7,
     seed: int = 42,
     class_names: Optional[List[str]] = None,
@@ -350,81 +331,46 @@ def load_real_and_gen_for_eval(
     max_per_group: Optional[int] = None,
 ) -> Tuple["BearingSignalDataset", "BearingSignalDataset", "BearingSignalDataset", int, List[str]]:
     """
-    加载真实数据与生成数据，并按 train_ratio 划分真实数据为 train/test。
+    加载真实数据与生成数据，使用相同的 max_per_class、max_per_group 抽样逻辑。
+    真实数据按 train_ratio 划分为 train/test；生成数据全部作为 gen_train。
 
-    真实数据支持两种结构：
-      1) 按类别分文件夹：real_data_path/IF0.2/*.npy, real_data_path/OF0.2/*.npy ...
-      2) 扁平单文件夹：real_data_path/*.npy（全部视为同一类别）
-
-    生成数据：gen_data_folder 下所有 .npy，统一标签为 gen_label。
-
-    返回
-    ----
-    real_train, gen_train, real_test : BearingSignalDataset
-    num_classes : int
-        总类别数（由真实数据推断，gen_label 必须在 [0, num_classes-1] 内）
-    class_names : List[str]
-        类别名称列表
+    目录结构（真实与生成一致）：
+      root/IF0.2/*.npy 或 root/IF0.2/1000 0/*.npy
     """
-    rng = np.random.default_rng(seed)
+    if not os.path.isdir(real_data_path):
+        raise FileNotFoundError(f"真实数据目录不存在: {real_data_path}")
+    if not os.path.isdir(gen_data_folder):
+        raise FileNotFoundError(f"生成数据目录不存在: {gen_data_folder}")
 
-    # 判断真实数据结构
-    subdirs = [
-        d for d in os.listdir(real_data_path)
-        if os.path.isdir(os.path.join(real_data_path, d))
-    ]
+    rng = np.random.default_rng(seed)
+    subdirs = [d for d in os.listdir(real_data_path)
+               if os.path.isdir(os.path.join(real_data_path, d))]
     npy_in_root = len(glob.glob(os.path.join(real_data_path, "*.npy")))
 
-    if subdirs and not npy_in_root:
-        # 按类别分文件夹（支持抽样）
-        if class_names is None:
-            class_names = sorted(subdirs)
-        if max_per_class is not None or max_per_group is not None:
-            real_full = BearingSignalDataset.from_class_folders_with_subsample(
-                real_data_path,
-                class_names=class_names,
-                max_per_class=max_per_class,
-                max_per_group=max_per_group,
-                seed=seed,
-            )
-        else:
-            real_full = BearingSignalDataset.from_class_folders(
-                real_data_path, class_names=class_names
-            )
-        num_classes = len(class_names)
-    else:
-        # 扁平单文件夹，单类别
-        all_sigs = []
-        for fp in sorted(glob.glob(os.path.join(real_data_path, "*.npy"))):
-            sig = np.load(fp).astype(np.float32)
-            if sig.ndim == 1:
-                sig = sig[np.newaxis, :]
-            elif sig.ndim == 2 and sig.shape[0] != 1:
-                sig = sig[:1, :]
-            all_sigs.append(sig)
-        if not all_sigs:
-            raise FileNotFoundError(f"No .npy files in {real_data_path}")
-        if max_per_class is not None and len(all_sigs) > max_per_class:
-            rng.shuffle(all_sigs)
-            all_sigs = all_sigs[:max_per_class]
-        signals = np.stack(all_sigs, axis=0)
-        labels = np.zeros(len(all_sigs), dtype=np.int64)
-        real_full = BearingSignalDataset(torch.from_numpy(signals), torch.from_numpy(labels))
-        num_classes = 1
-        class_names = ["类别0"] if class_names is None else class_names
+    if not subdirs and not npy_in_root:
+        raise FileNotFoundError(f"真实数据目录为空或不存在: {real_data_path}")
 
-    # 确保 gen_label 有效
-    if gen_label < 0 or gen_label >= num_classes:
-        gen_label = 0
-        if num_classes > 1:
-            print(f"Warning: gen_label 超出范围，已设为 0")
+    if class_names is None:
+        class_names = sorted(subdirs) if subdirs else ["类别0"]
+    num_classes = len(class_names)
+
+    # 统一加载逻辑：from_class_folders_with_subsample
+    def _load(root: str) -> "BearingSignalDataset":
+        return BearingSignalDataset.from_class_folders_with_subsample(
+            root, class_names=class_names,
+            max_per_class=max_per_class, max_per_group=max_per_group, seed=seed,
+        )
+
+    real_full = _load(real_data_path)
+    gen_train = _load(gen_data_folder)
 
     # 分层划分 real -> train / test
-    train_sigs, train_lbls = [], []
-    test_sigs, test_lbls = [], []
+    train_sigs, train_lbls, test_sigs, test_lbls = [], [], [], []
     for c in range(num_classes):
         mask = real_full.labels.numpy() == c
         idx = np.where(mask)[0]
+        if len(idx) == 0:
+            continue
         rng.shuffle(idx)
         n_train = max(1, int(len(idx) * train_ratio))
         n_test = len(idx) - n_train
@@ -436,71 +382,18 @@ def load_real_and_gen_for_eval(
         test_sigs.append(real_full.signals.numpy()[idx[n_train:]])
         test_lbls.append(real_full.labels.numpy()[idx[n_train:]])
 
-    real_train_sig = np.concatenate(train_sigs, axis=0)
-    real_train_lbl = np.concatenate(train_lbls, axis=0)
-    real_test_sig = np.concatenate(test_sigs, axis=0)
-    real_test_lbl = np.concatenate(test_lbls, axis=0)
+    if not train_sigs:
+        raise FileNotFoundError(f"真实数据加载后无样本: {real_data_path}")
 
     real_train = BearingSignalDataset(
-        torch.from_numpy(real_train_sig), torch.from_numpy(real_train_lbl)
+        torch.from_numpy(np.concatenate(train_sigs, axis=0)),
+        torch.from_numpy(np.concatenate(train_lbls, axis=0)),
     )
     real_test = BearingSignalDataset(
-        torch.from_numpy(real_test_sig), torch.from_numpy(real_test_lbl)
+        torch.from_numpy(np.concatenate(test_sigs, axis=0)),
+        torch.from_numpy(np.concatenate(test_lbls, axis=0)),
     )
-
-    # 加载生成数据（支持按类子目录或扁平目录）
-    gen_train = _load_gen_from_root_or_flat(
-        gen_data_folder, class_names, gen_label,
-        max_per_class=max_per_class, seed=seed,
-    )
-
     return real_train, gen_train, real_test, num_classes, class_names
-
-
-def load_gen_only_for_eval(
-    gen_data_folder: str,
-    train_ratio: float = 0.5,
-    seed: int = 42,
-) -> Tuple["BearingSignalDataset", "BearingSignalDataset", "BearingSignalDataset", int, List[str]]:
-    """
-    仅从生成数据目录加载，将其划分为「参考真实」(前一半) 与「生成」(后一半)，
-    用于仅有 generated_samples_infer 时的时频对比与 t-SNE。
-    TRTR/TSTR 将退化为单类（准确率恒为 1.0）。
-
-    返回
-    ----
-    real_train, gen_train, real_test : 前一半作为 real，后一半作为 gen
-    num_classes : 1
-    class_names : ["生成信号"]
-    """
-    rng = np.random.default_rng(seed)
-    gen_full = load_from_flat_folder(gen_data_folder, label=0)
-    n = len(gen_full)
-    if n < 4:
-        raise ValueError(f"生成数据至少需 4 条，当前仅 {n} 条")
-    idx = np.arange(n)
-    rng.shuffle(idx)
-    n_real = n // 2
-    real_idx = idx[:n_real]
-    gen_idx = idx[n_real:]
-
-    real_sigs = gen_full.signals.numpy()[real_idx]
-    real_lbls = gen_full.labels.numpy()[real_idx]
-    gen_sigs = gen_full.signals.numpy()[gen_idx]
-    gen_lbls = gen_full.labels.numpy()[gen_idx]
-
-    n_real_train = max(1, int(n_real * train_ratio))
-    real_train = BearingSignalDataset(
-        torch.from_numpy(real_sigs[:n_real_train]),
-        torch.from_numpy(real_lbls[:n_real_train]),
-    )
-    real_test = BearingSignalDataset(
-        torch.from_numpy(real_sigs[n_real_train:]),
-        torch.from_numpy(real_lbls[n_real_train:]),
-    )
-    gen_train = BearingSignalDataset(torch.from_numpy(gen_sigs), torch.from_numpy(gen_lbls))
-
-    return real_train, gen_train, real_test, 1, ["生成信号"]
 
 
 # ---------------------------------------------------------------------------

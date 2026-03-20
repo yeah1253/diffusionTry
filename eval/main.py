@@ -1,21 +1,11 @@
 """
 main.py — 数据质量评估全流程入口
 
-支持三种数据模式：
-  1. 真实+生成：REAL_DATA_PATH 与 GEN_DATA_FOLDER 均有 .npy 时，完整 TRTR/TSTR
-  2. 仅生成：仅有 generated_samples_infer 时，划分为参考/生成做时频与 t-SNE
-  3. Dummy：冒烟测试，使用合成数据
+数据模式：
+  - USE_REAL_DATA=True：真实+生成数据，路径错误直接报错
+  - USE_REAL_DATA=False：Dummy 冒烟测试
 
-三大评估模块：
-  1. 时频域物理特征对比分析（时域波形、FFT 频谱）
-  2. 下游故障诊断分类 TRTR / TSTR 对比
-  3. t-SNE 特征空间可视化（降维图）
-
-运行方式：
-  cd diffusionTry
-  python -m eval.main
-
-依赖：torch, numpy, matplotlib, scikit-learn, scipy
+评估模块：时频对比、TRTR/TSTR、t-SNE
 """
 
 from __future__ import annotations
@@ -23,21 +13,18 @@ from __future__ import annotations
 import os
 import time
 
-# 处理 OpenMP 冲突（Windows 下 torch + numpy 可能会出现）
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 import torch
 import matplotlib
-# 若无 GUI，使用非交互后端
 matplotlib.use("Agg")
-# 配置中文字体，消除 "Glyph missing from font" 警告（Windows 常用 SimHei/微软雅黑）
 import matplotlib.pyplot as _plt
 _plt.rcParams["font.sans-serif"] = ["SimHei", "Microsoft YaHei", "SimSun", "DejaVu Sans"]
-_plt.rcParams["axes.unicode_minus"] = False  # 负号显示
+_plt.rcParams["axes.unicode_minus"] = False
 import warnings
 warnings.filterwarnings("ignore", message=".*Glyph.*missing.*")
 
-from eval.dataset import make_dummy_datasets, load_real_and_gen_for_eval, load_gen_only_for_eval
+from eval.dataset import make_dummy_datasets, load_real_and_gen_for_eval
 from eval.eval_time_freq import run_time_freq_analysis
 from eval.train_diagnosis import run_trtr_tstr
 from eval.train_diagnosis_simple import run_trtr_tstr_simple
@@ -45,94 +32,42 @@ from eval.visualize_tsne import run_tsne_visualization
 
 
 def main() -> None:
-    """全流程冒烟测试入口。"""
-    # =====================================================================
-    # 基本配置
-    # =====================================================================
-    SEQ_LENGTH = 1024         # 信号长度（需与 infer/train 一致）
-    FS = 25600.0              # 采样率 (Hz)
-    TRAIN_RATIO = 0.7         # 真实数据 train/test 划分比例
-    NUM_EPOCHS = 30           # CNN 分类器训练轮数（USE_SIMPLE_CLASSIFIER=False 时用）
-    BATCH_SIZE = 32            # CNN 批大小
-    LR = 1e-3                  # CNN 学习率
-    LOW_FREQ_LIMIT = 1000.0   # 频谱低频聚焦上界 (Hz)
+    # 配置
+    SEQ_LENGTH = 1024
+    FS = 25600.0
+    TRAIN_RATIO = 0.7
+    NUM_EPOCHS = 30
+    BATCH_SIZE = 32
+    LR = 1e-3
+    LOW_FREQ_LIMIT = 1000.0
 
-    # ---------- 下游分类器选择 ----------
-    USE_SIMPLE_CLASSIFIER = True   # True: 手工特征+RandomForest；False: 1D-CNN
-    MAX_SAMPLES_PER_CLASS = 500    # 每类最多样本数，控制单故障样本过多
-    MAX_SAMPLES_PER_GROUP = 50     # 每组(RPM,Load)最多样本数，None 则不按组限
-    # 项目根目录（与 eval 文件夹同级，generated_samples_infer 所在位置）
+    USE_SIMPLE_CLASSIFIER = False
+    MAX_SAMPLES_PER_CLASS = 960
+    MAX_SAMPLES_PER_GROUP = 40
+
     _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    SAVE_DIR = os.path.join(_PROJECT_ROOT, "eval_results")  # 结果保存目录
-
-    # ---------- 数据来源模式 ----------
-    USE_REAL_DATA = True      # True: 使用真实+生成数据；False: Dummy 冒烟测试
-    USE_GEN_ONLY = False      # 仅生成数据模式（无真实数据时自动启用）
-    REAL_DATA_PATH = r"D:\data\轴承数据集"  # 10 类：根目录（含 NC/IF0.2/...）；单类：如 .../IF0.2
-    GEN_DATA_FOLDER = os.path.join(_PROJECT_ROOT, "generated_samples_infer")  # 固定为项目根下的 generated_samples_infer
-    GEN_LABEL = 0             # 生成数据对应类别标签（单类为 0）
-    CLASS_NAMES = None        # 10 类时可设为 ["NC","IF0.2",...,"RF0.6"]，None 则按文件夹自动推断
+    SAVE_DIR = os.path.join(_PROJECT_ROOT, "eval_results")
+    REAL_DATA_PATH = r"D:\data\轴承数据集"
+    GEN_DATA_FOLDER = os.path.join(_PROJECT_ROOT, "generated_samples_infer")
+    USE_REAL_DATA = True
     NUM_CLASSES_DUMMY = 4
     SAMPLES_PER_CLASS_DUMMY = 80
 
     os.makedirs(SAVE_DIR, exist_ok=True)
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"{'═'*60}")
-    print(f"  轴承故障振动信号 — 数据质量评估全流程")
-    print(f"{'═'*60}")
-    print(f"  设备: {device}")
-    if device.type == "cuda":
-        print(f"  GPU: {torch.cuda.get_device_name(0)}")
-    mode_str = "真实+生成数据" if USE_REAL_DATA else "Dummy 冒烟测试"
-    print(f"  模式: {mode_str}")
-    print(f"  保存目录: {SAVE_DIR}")
-    print()
 
-    # =====================================================================
+    print(f"{'═'*60}\n  轴承故障振动信号 — 数据质量评估\n{'═'*60}")
+    print(f"  设备: {device}  模式: {'真实+生成' if USE_REAL_DATA else 'Dummy'}\n")
+
     # 1. 加载数据集
-    # =====================================================================
     print("[1] 加载数据集...")
     t0 = time.time()
-
     if USE_REAL_DATA:
-        if not os.path.isdir(GEN_DATA_FOLDER):
-            print(f"  生成数据目录不存在: {GEN_DATA_FOLDER}，退化为 Dummy 模式")
-            USE_REAL_DATA = False
-        elif not os.path.isdir(REAL_DATA_PATH):
-            print(f"  真实数据目录不存在: {REAL_DATA_PATH}")
-            if os.path.isdir(GEN_DATA_FOLDER):
-                print(f"  将使用生成数据划分进行时频对比与 t-SNE（仅生成模式）")
-                USE_GEN_ONLY = True
-            else:
-                USE_REAL_DATA = False
-        else:
-            import glob
-            npy_count = len(glob.glob(os.path.join(REAL_DATA_PATH, "*.npy")))
-            subdirs = [d for d in os.listdir(REAL_DATA_PATH)
-                       if os.path.isdir(os.path.join(REAL_DATA_PATH, d))]
-            subdir_npy = sum(1 for d in subdirs
-                             if glob.glob(os.path.join(REAL_DATA_PATH, d, "*.npy"))) if subdirs else 0
-            if npy_count == 0 and subdir_npy == 0:
-                print(f"  真实数据目录中无 .npy 文件（可能为 .mat 格式），使用仅生成模式")
-                USE_GEN_ONLY = True
-            else:
-                USE_GEN_ONLY = False
-
-    if USE_REAL_DATA and USE_GEN_ONLY:
-        real_train, gen_train, real_test, NUM_CLASSES, class_names = load_gen_only_for_eval(
-            gen_data_folder=GEN_DATA_FOLDER,
-            train_ratio=TRAIN_RATIO,
-            seed=42,
-        )
-    elif USE_REAL_DATA:
         real_train, gen_train, real_test, NUM_CLASSES, class_names = load_real_and_gen_for_eval(
             real_data_path=REAL_DATA_PATH,
             gen_data_folder=GEN_DATA_FOLDER,
-            gen_label=GEN_LABEL,
             train_ratio=TRAIN_RATIO,
             seed=42,
-            class_names=CLASS_NAMES,
             max_per_class=MAX_SAMPLES_PER_CLASS,
             max_per_group=MAX_SAMPLES_PER_GROUP,
         )
@@ -147,10 +82,7 @@ def main() -> None:
         NUM_CLASSES = NUM_CLASSES_DUMMY
         class_names = [f"故障类型 {i}" for i in range(NUM_CLASSES)]
 
-    print(f"  真实训练集: {len(real_train)} 条")
-    print(f"  生成训练集: {len(gen_train)} 条")
-    print(f"  真实测试集: {len(real_test)} 条")
-    print(f"  类别数: {NUM_CLASSES}")
+    print(f"  真实 train/test: {len(real_train)}/{len(real_test)}  生成: {len(gen_train)}  类别: {NUM_CLASSES}")
     print(f"  耗时: {time.time() - t0:.2f}s\n")
 
     # =====================================================================
