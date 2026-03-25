@@ -15,7 +15,7 @@ def find_latest_checkpoint(results_folder: str) -> str:
     """
     在给定目录中查找最新的 model-*.pt 权重文件。
     """
-    pattern = os.path.join(results_folder, "bear_digtal_model.pt")
+    pattern = os.path.join(results_folder, "model-*.pt")
     paths = glob.glob(pattern)
     if not paths:
         raise FileNotFoundError(f"No checkpoint files found in {results_folder}")
@@ -84,7 +84,12 @@ def load_trained_diffusion_from_checkpoint(
     """
     device = next(diffusion.parameters()).device
     data = torch.load(ckpt_path, map_location=device, weights_only=False)
-    diffusion.load_state_dict(data["model"])
+    load_result = diffusion.load_state_dict(data["model"], strict=False)
+    missing, unexpected = load_result.missing_keys, load_result.unexpected_keys
+    if missing:
+        print(f"Warning: missing keys when loading checkpoint: {missing}")
+    if unexpected:
+        print(f"Warning: unexpected keys when loading checkpoint: {unexpected}")
     diffusion.eval()
     return diffusion
 
