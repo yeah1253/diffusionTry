@@ -54,12 +54,13 @@ if isempty(data_ready)
     last_rpm      = target_rpm;
     pkt_idx       = int32(0);  % 当前要输出/发送的 128 段序号（0-based）
 
-    % ★ 关键改动：coder.const 替代 coder.extrinsic，兼容 Speedgoat
-    hil = coder.const(hil_get_const_data(MAX_COND, SIGNAL_LEN));
-    sig_matrix = hil.sig_matrix;
-    load_vec   = hil.load_vec;
-    rpm_vec    = hil.rpm_vec;
-    n_cond     = int32(hil.n_cond);
+    % ★ coder.const 返回 double 矩阵（非 struct），兼容 Speedgoat 代码生成
+    % packed 布局: Row1=[n_cond, loads...], Row2=[0, rpms...], Row3+=[sig_matrix]
+    packed     = coder.const(hil_get_const_data(MAX_COND, SIGNAL_LEN));
+    n_cond     = int32(packed(1, 1));
+    load_vec   = packed(1, 2:MAX_COND+1)';
+    rpm_vec    = packed(2, 2:MAX_COND+1)';
+    sig_matrix = packed(3:MAX_COND+2, :);
 
     if n_cond > 0
         data_ready  = true;
