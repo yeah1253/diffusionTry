@@ -1,7 +1,8 @@
 function [sig_matrix, load_vec, rpm_vec, n_cond] = load_hil_mat_data(max_cond, signal_len, hil_data_mat)
 %LOAD_HIL_MAT_DATA  从 HIL_data.mat 加载信号数据（主机 / 打包脚本用）
 %
-% 不再由 hil_get_const_data 调用（避免 Simulink Coder 分析本文件）。
+% 仅由 pack_hil_for_coder / 交互调用。hil_get_const_data 必须用 coder.load，不得调用本文件，
+% 否则 Simulink Coder 会分析 try/which/load 并报错。
 % 构建模型前请运行 pack_hil_for_coder.m 生成 HIL_packed_for_codegen.mat。
 %
 % 第三参数 hil_data_mat（可选）: HIL_data.mat 的完整路径，或包含该文件的文件夹。

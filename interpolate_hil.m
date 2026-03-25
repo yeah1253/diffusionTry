@@ -25,6 +25,10 @@ SIGNAL_LEN      = 1024;   % 信号长度，须与 .mat 中实际一致
 PACKET_LEN      = 128;    % 每次 UDP 发送的数据点数量
 NUM_PACKETS     = int32(SIGNAL_LEN / PACKET_LEN); % 1024/128 = 8
 MAX_COND        = 1500;   % 须 >= 实际工况数；与 pack_hil_for_coder / HIL_packed 行数一致（全网格 31*41=1271）
+PACKED_COLS     = SIGNAL_LEN;
+if (MAX_COND + 1) > PACKED_COLS
+    PACKED_COLS = MAX_COND + 1;   % 行1需列 1..(MAX_COND+1) 放 n_cond 与 load_vec
+end
 K_NEIGHBORS     = 6;      % IDW 最近邻数量
 IDW_POWER       = 2.0;    % IDW 距离衰减指数
 REGEN_INTERVAL  = 0.5;    % 每隔多少秒生成新的增强样本（秒）
@@ -54,13 +58,14 @@ if isempty(data_ready)
     last_rpm      = target_rpm;
     pkt_idx       = int32(0);  % 当前要输出/发送的 128 段序号（0-based）
 
-    % ★ coder.const 返回 double 矩阵（非 struct），兼容 Speedgoat 代码生成
-    % packed 布局: Row1=[n_cond, loads...], Row2=[0, rpms...], Row3+=[sig_matrix]
-    packed     = coder.const(hil_get_const_data(MAX_COND, SIGNAL_LEN));
+    % ★ coder.const 返回 double 矩阵（非 struct）。列宽 PACKED_COLS >= MAX_COND+1，
+    % 否则 MAX_COND>SIGNAL_LEN 时第1行放不下 [n_cond, load_vec(1:MAX_COND)] 会越界。
+    % packed 布局: Row1=[n_cond, loads...], Row2=[0, rpms...], Row3+: sig 仅占 1:SIGNAL_LEN 列
+    packed     = coder.const(hil_get_const_data(MAX_COND, SIGNAL_LEN, PACKED_COLS));
     n_cond     = int32(packed(1, 1));
     load_vec   = packed(1, 2:MAX_COND+1)';
     rpm_vec    = packed(2, 2:MAX_COND+1)';
-    sig_matrix = packed(3:MAX_COND+2, :);
+    sig_matrix = packed(3:MAX_COND+2, 1:SIGNAL_LEN);
 
     if n_cond > 0
         data_ready  = true;
@@ -101,9 +106,9 @@ end
 
 % 每次调用只输出一段 PACKET_LEN 点（顺序分片发送）
 idx_start = double(pkt_idx) * double(PACKET_LEN) + 1;
-idx_end   = idx_start + double(PACKET_LEN) - 1;
-signal_out = cur_signal(idx_start:idx_end);
-
+for i = 1:PACKET_LEN
+    signal_out(i) = cur_signal(idx_start + i - 1);
+end
 % 下次调用输出下一段
 pkt_idx = pkt_idx + 1;
 if pkt_idx >= NUM_PACKETS
