@@ -1,18 +1,35 @@
 function data = hil_get_const_data(max_cond, signal_len)
-%HIL_GET_CONST_DATA  将 HIL 数据打包为结构体，供 coder.const 在构建时调用
+%HIL_GET_CONST_DATA  Pack struct for coder.const (Simulink Coder / Speedgoat)
 %
-% 本函数仅在 Simulink 构建（Build）阶段由主机 PC 执行，
-% 结果作为编译期常量嵌入 Speedgoat 二进制文件，运行时不访问任何文件。
+% This file must contain ONLY constructs supported by MATLAB Coder, because it
+% is analyzed when used inside coder.const(...) from a MATLAB Function block.
+% Raw HIL_data.mat parsing stays in load_hil_mat_data.m (host / pack step only).
 %
-% 调用方式（在 interpolate_hil.m 中）:
+% Before building the model, run pack_hil_for_coder.m once (when HIL_data changes)
+% to generate HIL_packed_for_codegen.mat next to this file / on the MATLAB path.
+%
 %   hil = coder.const(hil_get_const_data(MAX_COND, SIGNAL_LEN));
 
-[sig_matrix, load_vec, rpm_vec, n_cond] = load_hil_mat_data(max_cond, signal_len);
+%#codegen
 
-data.sig_matrix = sig_matrix;          % [max_cond × signal_len] double
-data.load_vec   = load_vec;            % [max_cond × 1] double
-data.rpm_vec    = rpm_vec;             % [max_cond × 1] double
-data.n_cond     = double(n_cond);      % scalar double（coder.const 不支持 int32 顶层字段）
+S = coder.load('HIL_packed_for_codegen.mat');
 
-fprintf('[hil_get_const_data] 数据打包完成，共 %d 个工况，将嵌入目标机二进制文件\n', n_cond);
+% Rows must equal MAX_COND from interpolate_hil; cols must equal SIGNAL_LEN.
+% Repack with pack_hil_for_coder(MAX_COND, SIGNAL_LEN, ...) if this fails.
+if size(S.sig_matrix, 2) ~= signal_len
+    assert(false);
+end
+if size(S.sig_matrix, 1) ~= max_cond
+    assert(false);
+end
+nc = double(S.n_cond);
+if nc < 0.0 || nc > double(max_cond) || nc > double(size(S.sig_matrix, 1))
+    assert(false);
+end
+
+data.sig_matrix = S.sig_matrix;
+data.load_vec   = S.load_vec;
+data.rpm_vec    = S.rpm_vec;
+data.n_cond     = double(S.n_cond);
+
 end

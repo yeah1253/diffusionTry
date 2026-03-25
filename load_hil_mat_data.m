@@ -1,8 +1,11 @@
-function [sig_matrix, load_vec, rpm_vec, n_cond] = load_hil_mat_data(max_cond, signal_len)
-%LOAD_HIL_MAT_DATA  从 HIL_data.mat 加载信号数据（extrinsic 辅助函数）
+function [sig_matrix, load_vec, rpm_vec, n_cond] = load_hil_mat_data(max_cond, signal_len, hil_data_mat)
+%LOAD_HIL_MAT_DATA  从 HIL_data.mat 加载信号数据（主机 / 打包脚本用）
 %
-% 由 interpolate_hil 通过 coder.extrinsic 调用，在 MATLAB 中执行，
-% 不参与 Simulink 代码生成，因此可使用 try/catch、load、fieldnames 等。
+% 不再由 hil_get_const_data 调用（避免 Simulink Coder 分析本文件）。
+% 构建模型前请运行 pack_hil_for_coder.m 生成 HIL_packed_for_codegen.mat。
+%
+% 第三参数 hil_data_mat（可选）: HIL_data.mat 的完整路径，或包含该文件的文件夹。
+% 省略时仍尝试 bdroot 目录，否则当前工作目录。
 %
 % HIL_data.mat 数据结构:
 %   IF0_2 / IF0_4 / IF0_6  (1×1 struct)
@@ -20,20 +23,26 @@ load_vec   = zeros(max_cond, 1);
 rpm_vec    = zeros(max_cond, 1);
 n_cond     = int32(0);
 
-% ── 定位 HIL_data.mat（与 Simulink 模型同目录）───────────────
-try
-    mdl_dir = fileparts(which(bdroot));
-catch
-    mdl_dir = '';
+% ── 定位 HIL_data.mat ────────────────────────────────────────
+if nargin >= 3 && ~isempty(hil_data_mat)
+    mat_path = char(hil_data_mat);
+    if isfolder(mat_path)
+        mat_path = fullfile(mat_path, 'HIL_data.mat');
+    end
+else
+    try
+        mdl_dir = fileparts(which(bdroot));
+    catch
+        mdl_dir = '';
+    end
+    if isempty(mdl_dir)
+        mdl_dir = pwd;
+    end
+    mat_path = fullfile(mdl_dir, 'HIL_data.mat');
 end
-if isempty(mdl_dir)
-    mdl_dir = pwd;
-end
-
-mat_path = fullfile(mdl_dir, 'HIL_data.mat');
 
 if ~isfile(mat_path)
-    warning('[load_hil_mat_data] 找不到文件: %s', mat_path);
+    warning('[load_hil_mat_data] File not found: %s', mat_path);
     return;
 end
 
@@ -41,12 +50,12 @@ end
 try
     raw = load(mat_path, FAULT_VAR);
 catch ME
-    warning('[load_hil_mat_data] 加载 .mat 失败: %s', ME.message);
+    warning('[load_hil_mat_data] load failed: %s', ME.message);
     return;
 end
 
 if ~isfield(raw, FAULT_VAR)
-    warning('[load_hil_mat_data] .mat 中没有变量 "%s"', FAULT_VAR);
+    warning('[load_hil_mat_data] Variable "%s" not in .mat', FAULT_VAR);
     return;
 end
 
@@ -103,7 +112,7 @@ for li = 1:numel(load_fields)
 
         cnt = cnt + int32(1);
         if cnt > int32(max_cond)
-            warning('[load_hil_mat_data] 工况数超出 MAX_COND=%d，请增大上限', max_cond);
+            warning('[load_hil_mat_data] Condition count exceeds MAX_COND=%d; increase limit', max_cond);
             n_cond = cnt - int32(1);
             return;
         end
@@ -115,5 +124,5 @@ for li = 1:numel(load_fields)
 end
 
 n_cond = cnt;
-fprintf('[load_hil_mat_data] 成功加载 %s，共 %d 个工况\n', FAULT_VAR, n_cond);
+fprintf('[load_hil_mat_data] Loaded %s, %d conditions\n', FAULT_VAR, n_cond);
 end

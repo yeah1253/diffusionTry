@@ -1,10 +1,12 @@
 function signal_out = interpolate_hil(target_load, target_rpm, t)
 %INTERPOLATE_HIL  Method B 插值 + 两阶段数据增强（Simulink MATLAB Function Block）
 %
-% ★ 配套文件（需与 .slx 放在同一目录）:
-%     load_hil_mat_data.m  — 解析 HIL_data.mat（仅在主机 Build 阶段运行）
-%     hil_get_const_data.m — 打包数据为 struct 供 coder.const 使用
-%     HIL_data.mat         — 原始数据（仅主机 PC 需要，Speedgoat 不需要）
+% ★ 配套文件（需与 .slx 同目录或在 MATLAB 路径上）:
+%     HIL_packed_for_codegen.mat — 由 pack_hil_for_coder.m 生成；coder.const 嵌入用（必）
+%     hil_get_const_data.m        — coder.load 读取上述 .mat（仅 Coder 可解析代码）
+%     pack_hil_for_coder.m        — 主机上运行一次，从 HIL_data.mat 生成 packed .mat
+%     load_hil_mat_data.m         — 仅 pack 脚本 / 交互使用（含 try/which，不进 Coder）
+%     HIL_data.mat                — 原始数据；打包时需要，目标机运行不需要
 % ★ Simulink 模型中需添加 Clock 模块并连接到第三个输入端口 t
 %
 % 部署说明:
@@ -16,21 +18,23 @@ function signal_out = interpolate_hil(target_load, target_rpm, t)
 %   target_rpm      - 目标转速值
 %   t               - 仿真当前时间（来自 Clock 模块，单位：秒）
 % 输出:
-%   signal_out      - 1×SIGNAL_LEN 时域信号，每 REGEN_INTERVAL 秒自动刷新
+%   signal_out      - 1×PACKET_LEN 时域信号；每 REGEN_INTERVAL 秒刷新整个 1024 点样本，并从第 1 段重新按顺序输出
 
 % ══ 配置参数（按需修改）══════════════════════════════════════
 SIGNAL_LEN      = 1024;   % 信号长度，须与 .mat 中实际一致
-MAX_COND        = 500;    % 最大工况数预分配（已增大以消除警告）
+PACKET_LEN      = 128;    % 每次 UDP 发送的数据点数量
+NUM_PACKETS     = int32(SIGNAL_LEN / PACKET_LEN); % 1024/128 = 8
+MAX_COND        = 1500;   % 须 >= 实际工况数；与 pack_hil_for_coder / HIL_packed 行数一致（全网格 31*41=1271）
 K_NEIGHBORS     = 6;      % IDW 最近邻数量
 IDW_POWER       = 2.0;    % IDW 距离衰减指数
 REGEN_INTERVAL  = 0.5;    % 每隔多少秒生成新的增强样本（秒）
 
 % ══ Persistent 缓存 ══════════════════════════════════════════
 persistent sig_matrix load_vec rpm_vec n_cond data_ready
-persistent base_signal cur_signal last_interval last_load last_rpm
+persistent base_signal cur_signal last_interval last_load last_rpm pkt_idx
 
 % 默认输出（防止未赋值报错）
-signal_out = zeros(1, SIGNAL_LEN);
+signal_out = zeros(1, PACKET_LEN);
 F = floor(SIGNAL_LEN / 2) + 1;   % 单边谱长度
 
 % ══ 首次调用：通过 coder.const 加载数据（Speedgoat 兼容）══════
@@ -48,6 +52,7 @@ if isempty(data_ready)
     last_interval = -1.0;
     last_load     = target_load;
     last_rpm      = target_rpm;
+    pkt_idx       = int32(0);  % 当前要输出/发送的 128 段序号（0-based）
 
     % ★ 关键改动：coder.const 替代 coder.extrinsic，兼容 Speedgoat
     hil = coder.const(hil_get_const_data(MAX_COND, SIGNAL_LEN));
@@ -84,14 +89,25 @@ if load_chg || rpm_chg
                       K_NEIGHBORS, IDW_POWER, SIGNAL_LEN, F, MAX_COND);
     cur_signal    = generate_aug(base_signal, SIGNAL_LEN, F);
     last_interval = cur_ivl;
+    pkt_idx       = int32(0);  % 新样本从第 1 段开始发送
 
 elseif cur_ivl ~= last_interval
     % 到达下一个 0.5s 间隔 → 保持基础信号，生成新增强样本
     cur_signal    = generate_aug(base_signal, SIGNAL_LEN, F);
     last_interval = cur_ivl;
+    pkt_idx       = int32(0);  % 新样本从第 1 段开始发送
 end
 
-signal_out = cur_signal;
+% 每次调用只输出一段 PACKET_LEN 点（顺序分片发送）
+idx_start = double(pkt_idx) * double(PACKET_LEN) + 1;
+idx_end   = idx_start + double(PACKET_LEN) - 1;
+signal_out = cur_signal(idx_start:idx_end);
+
+% 下次调用输出下一段
+pkt_idx = pkt_idx + 1;
+if pkt_idx >= NUM_PACKETS
+    pkt_idx = int32(0);
+end
 
 end  % ══ 主函数结束 ════════════════════════════════════════════
 
