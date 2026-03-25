@@ -1,8 +1,15 @@
 function signal_out = interpolate_hil(target_load, target_rpm, t)
 %INTERPOLATE_HIL  Method B 插值 + 两阶段数据增强（Simulink MATLAB Function Block）
 %
-% ★ 配套文件: load_hil_mat_data.m（需与 .slx 和 HIL_data.mat 放在同一目录）
+% ★ 配套文件（需与 .slx 放在同一目录）:
+%     load_hil_mat_data.m  — 解析 HIL_data.mat（仅在主机 Build 阶段运行）
+%     hil_get_const_data.m — 打包数据为 struct 供 coder.const 使用
+%     HIL_data.mat         — 原始数据（仅主机 PC 需要，Speedgoat 不需要）
 % ★ Simulink 模型中需添加 Clock 模块并连接到第三个输入端口 t
+%
+% 部署说明:
+%   数据通过 coder.const 在 Build 时嵌入目标机，Speedgoat 运行时无需访问文件。
+%   UDP 发送：将 signal_out 连接到 Simulink UDP Send 块即可，无需修改本函数。
 %
 % 输入:
 %   target_load     - 目标负载值
@@ -18,9 +25,6 @@ K_NEIGHBORS     = 6;      % IDW 最近邻数量
 IDW_POWER       = 2.0;    % IDW 距离衰减指数
 REGEN_INTERVAL  = 0.5;    % 每隔多少秒生成新的增强样本（秒）
 
-% ══ extrinsic：数据加载函数在 MATLAB 中执行，不参与代码生成 ══
-coder.extrinsic('load_hil_mat_data');
-
 % ══ Persistent 缓存 ══════════════════════════════════════════
 persistent sig_matrix load_vec rpm_vec n_cond data_ready
 persistent base_signal cur_signal last_interval last_load last_rpm
@@ -29,9 +33,11 @@ persistent base_signal cur_signal last_interval last_load last_rpm
 signal_out = zeros(1, SIGNAL_LEN);
 F = floor(SIGNAL_LEN / 2) + 1;   % 单边谱长度
 
-% ══ 首次调用：加载数据、插值基础信号、生成第一个增强样本 ═════
+% ══ 首次调用：通过 coder.const 加载数据（Speedgoat 兼容）══════
+% coder.const 作用：
+%   - 普通仿真时：在 MATLAB 中正常调用 hil_get_const_data（与之前 extrinsic 效果相同）
+%   - Speedgoat 部署时：在主机 PC Build 阶段执行，把数据嵌入二进制，目标机运行时无需访问文件
 if isempty(data_ready)
-    % 先声明所有 persistent 变量的类型和大小
     data_ready    = false;
     sig_matrix    = zeros(MAX_COND, SIGNAL_LEN);
     load_vec      = zeros(MAX_COND, 1);
@@ -43,9 +49,12 @@ if isempty(data_ready)
     last_load     = target_load;
     last_rpm      = target_rpm;
 
-    % 通过 extrinsic 加载 .mat 文件（可使用完整 MATLAB 特性）
-    [sig_matrix, load_vec, rpm_vec, n_cond] = ...
-        load_hil_mat_data(MAX_COND, SIGNAL_LEN);
+    % ★ 关键改动：coder.const 替代 coder.extrinsic，兼容 Speedgoat
+    hil = coder.const(hil_get_const_data(MAX_COND, SIGNAL_LEN));
+    sig_matrix = hil.sig_matrix;
+    load_vec   = hil.load_vec;
+    rpm_vec    = hil.rpm_vec;
+    n_cond     = int32(hil.n_cond);
 
     if n_cond > 0
         data_ready  = true;
