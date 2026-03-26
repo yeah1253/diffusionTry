@@ -1,4 +1,4 @@
-function [sig_matrix, load_vec, rpm_vec, n_cond] = load_hil_mat_data(max_cond, signal_len, hil_data_mat)
+function [sig_matrix, load_vec, rpm_vec, n_cond] = load_hil_mat_data(max_cond, signal_len, hil_data_mat, fault_var)
 %LOAD_HIL_MAT_DATA  从 HIL_data.mat 加载信号数据（主机 / 打包脚本用）
 %
 % 仅由 pack_hil_for_coder / 交互调用。hil_get_const_data 必须用 coder.load，不得调用本文件，
@@ -14,9 +14,13 @@ function [sig_matrix, load_vec, rpm_vec, n_cond] = load_hil_mat_data(max_cond, s
 %       .rpm1000, .rpm2000, ... (字段名末尾数字 = 实际转速值)
 %         .filtered0, .filtered1, ... (1×1024 single，多滤波样本)
 %
-% ★ 修改 FAULT_VAR 选择故障类型: 'IF0_2' / 'IF0_4' / 'IF0_6'
+% 第四参数 fault_var（可选）: .mat 顶层变量名，须与 HIL_data.mat 中一致，如 'IF0_2' / 'IF0_4' / 'IF0_6'
 
-FAULT_VAR = 'IF0_2';
+if nargin < 4 || isempty(fault_var)
+    fault_var = 'IF0_2';
+else
+    fault_var = char(fault_var);
+end
 
 % 初始化输出（固定大小，由调用方的 max_cond 和 signal_len 决定）
 sig_matrix = zeros(max_cond, signal_len);
@@ -49,18 +53,18 @@ end
 
 % ── 加载并解析层级结构 ────────────────────────────────────────
 try
-    raw = load(mat_path, FAULT_VAR);
+    raw = load(mat_path, fault_var);
 catch ME
     warning('[load_hil_mat_data] load failed: %s', ME.message);
     return;
 end
 
-if ~isfield(raw, FAULT_VAR)
-    warning('[load_hil_mat_data] Variable "%s" not in .mat', FAULT_VAR);
+if ~isfield(raw, fault_var)
+    warning('[load_hil_mat_data] Variable "%s" not in .mat', fault_var);
     return;
 end
 
-fault_struct = raw.(FAULT_VAR);
+fault_struct = raw.(fault_var);
 load_fields  = fieldnames(fault_struct);
 cnt = int32(0);
 
@@ -95,8 +99,8 @@ for li = 1:numel(load_fields)
         % ── 遍历 filteredZ 层：多样本取均值 ─────────────────
         acc_sig = zeros(1, signal_len);
         n_filt  = 0;
-        for fi = 1:numel(filt_fields)
-            ff = filt_fields{fi};
+        for fii = 1:numel(filt_fields)
+            ff = filt_fields{fii};
             if numel(ff) <= 8 || ~strcmp(ff(1:8), 'filtered')
                 continue;
             end
@@ -125,5 +129,5 @@ for li = 1:numel(load_fields)
 end
 
 n_cond = cnt;
-fprintf('[load_hil_mat_data] Loaded %s, %d conditions\n', FAULT_VAR, n_cond);
+fprintf('[load_hil_mat_data] Loaded %s, %d conditions\n', fault_var, n_cond);
 end

@@ -1,13 +1,13 @@
-function signal_out = interpolate_hil(target_load, target_rpm, t)
+function signal_out = interpolate_hil(target_load, target_rpm, fault_sel, t)
 %INTERPOLATE_HIL  Method B 插值 + 两阶段数据增强（Simulink MATLAB Function Block）
 %
 % ★ 配套文件（需与 .slx 同目录或在 MATLAB 路径上）:
-%     HIL_packed_for_codegen.mat — 由 pack_hil_for_coder.m 生成；coder.const 嵌入用（必）
+%     HIL_packed_for_codegen.mat — pack 生成，仅含变量 hil_packed（double）；coder.const 嵌入（必）
 %     hil_get_const_data.m        — coder.load 读取上述 .mat（仅 Coder 可解析代码）
-%     pack_hil_for_coder.m        — 主机上运行一次，从 HIL_data.mat 生成 packed .mat
-%     load_hil_mat_data.m         — 仅 pack 脚本 / 交互使用（含 try/which，不进 Coder）
+%     pack_hil_for_coder.m        — 主机运行；默认打包 IF0_2 / IF0_4 / IF0_6
+%     load_hil_mat_data.m         — 仅 pack 脚本使用（含 try/which，不进 Coder）
 %     HIL_data.mat                — 原始数据；打包时需要，目标机运行不需要
-% ★ Simulink 模型中需添加 Clock 模块并连接到第三个输入端口 t
+% ★ Simulink：四个输入依次为 target_load, target_rpm, fault_sel, t（Clock 接 t）
 %
 % 部署说明:
 %   数据通过 coder.const 在 Build 时嵌入目标机，Speedgoat 运行时无需访问文件。
@@ -16,6 +16,7 @@ function signal_out = interpolate_hil(target_load, target_rpm, t)
 % 输入:
 %   target_load     - 目标负载值
 %   target_rpm      - 目标转速值
+%   fault_sel       - 故障类型：1=IF0_2，2=IF0_4，3=IF0_6（与 HIL_data.mat 变量名一致）
 %   t               - 仿真当前时间（来自 Clock 模块，单位：秒）
 % 输出:
 %   signal_out      - 1×PACKET_LEN 时域信号；每 REGEN_INTERVAL 秒刷新整个 1024 点样本，并从第 1 段重新按顺序输出
@@ -24,7 +25,8 @@ function signal_out = interpolate_hil(target_load, target_rpm, t)
 SIGNAL_LEN      = 1024;   % 信号长度，须与 .mat 中实际一致
 PACKET_LEN      = 128;    % 每次 UDP 发送的数据点数量
 NUM_PACKETS     = int32(SIGNAL_LEN / PACKET_LEN); % 1024/128 = 8
-MAX_COND        = 1500;   % 须 >= 实际工况数；与 pack_hil_for_coder / HIL_packed 行数一致（全网格 31*41=1271）
+MAX_COND        = 1500;   % 须 >= 实际工况数；与 pack_hil_for_coder / HIL_packed 行数一致
+N_FAULT         = 3;      % 打包的故障种类数，须与 pack_hil_for_coder 中 fault_list 一致
 PACKED_COLS     = SIGNAL_LEN;
 if (MAX_COND + 1) > PACKED_COLS
     PACKED_COLS = MAX_COND + 1;   % 行1需列 1..(MAX_COND+1) 放 n_cond 与 load_vec
@@ -34,20 +36,26 @@ IDW_POWER       = 2.0;    % IDW 距离衰减指数
 REGEN_INTERVAL  = 0.5;    % 每隔多少秒生成新的增强样本（秒）
 
 % ══ Persistent 缓存 ══════════════════════════════════════════
-persistent sig_matrix load_vec rpm_vec n_cond data_ready
-persistent base_signal cur_signal last_interval last_load last_rpm pkt_idx
+% 注意：已移除占用极大的 sig_matrix 缓存
+persistent sig_tensor load_vec rpm_vec n_cond data_ready
+persistent base_signal cur_signal last_interval last_load last_rpm pkt_idx last_fault_idx
 
 % 默认输出（防止未赋值报错）
 signal_out = zeros(1, PACKET_LEN);
 F = floor(SIGNAL_LEN / 2) + 1;   % 单边谱长度
 
+fault_idx = int32(round(fault_sel));
+if fault_idx < int32(1)
+    fault_idx = int32(1);
+end
+if fault_idx > int32(N_FAULT)
+    fault_idx = int32(N_FAULT);
+end
+
 % ══ 首次调用：通过 coder.const 加载数据（Speedgoat 兼容）══════
-% coder.const 作用：
-%   - 普通仿真时：在 MATLAB 中正常调用 hil_get_const_data（与之前 extrinsic 效果相同）
-%   - Speedgoat 部署时：在主机 PC Build 阶段执行，把数据嵌入二进制，目标机运行时无需访问文件
 if isempty(data_ready)
     data_ready    = false;
-    sig_matrix    = zeros(MAX_COND, SIGNAL_LEN);
+    sig_tensor    = zeros(N_FAULT, MAX_COND, SIGNAL_LEN);
     load_vec      = zeros(MAX_COND, 1);
     rpm_vec       = zeros(MAX_COND, 1);
     n_cond        = int32(0);
@@ -56,20 +64,26 @@ if isempty(data_ready)
     last_interval = -1.0;
     last_load     = target_load;
     last_rpm      = target_rpm;
-    pkt_idx       = int32(0);  % 当前要输出/发送的 128 段序号（0-based）
+    pkt_idx       = int32(0);
+    last_fault_idx = int32(0);
 
-    % ★ coder.const 返回 double 矩阵（非 struct）。列宽 PACKED_COLS >= MAX_COND+1，
-    % 否则 MAX_COND>SIGNAL_LEN 时第1行放不下 [n_cond, load_vec(1:MAX_COND)] 会越界。
-    % packed 布局: Row1=[n_cond, loads...], Row2=[0, rpms...], Row3+: sig 仅占 1:SIGNAL_LEN 列
-    packed     = coder.const(hil_get_const_data(MAX_COND, SIGNAL_LEN, PACKED_COLS));
+    % ★ coder.const：多故障纵向堆叠
+    BR = MAX_COND + 2;
+    packed     = coder.const(hil_get_const_data(MAX_COND, SIGNAL_LEN, PACKED_COLS, N_FAULT));
     n_cond     = int32(packed(1, 1));
     load_vec   = packed(1, 2:MAX_COND+1)';
     rpm_vec    = packed(2, 2:MAX_COND+1)';
-    sig_matrix = packed(3:MAX_COND+2, 1:SIGNAL_LEN);
+    for kf = 1:N_FAULT
+        b = (kf - 1) * BR;
+        sig_tensor(kf, 1:MAX_COND, 1:SIGNAL_LEN) = packed(b+3:b+BR, 1:SIGNAL_LEN);
+    end
+
+    last_fault_idx = fault_idx;
 
     if n_cond > 0
         data_ready  = true;
-        base_signal = compute_interp(sig_matrix, load_vec, rpm_vec, ...
+        % 直接将 sig_tensor 和 fault_idx 传入，按需提取
+        base_signal = compute_interp(sig_tensor, fault_idx, load_vec, rpm_vec, ...
                           double(n_cond), target_load, target_rpm, ...
                           K_NEIGHBORS, IDW_POWER, SIGNAL_LEN, F, MAX_COND);
         cur_signal    = generate_aug(base_signal, SIGNAL_LEN, F);
@@ -84,13 +98,20 @@ end
 % ══ 每步检查：是否需要生成新样本 ═════════════════════════════
 load_chg = abs(target_load - last_load) > 1e-6;
 rpm_chg  = abs(target_rpm  - last_rpm ) > 1e-6;
+fault_changed = (fault_idx ~= last_fault_idx);
 cur_ivl  = floor(t / REGEN_INTERVAL);
 
-if load_chg || rpm_chg
-    % 工况改变 → 重新插值基础信号并立即生成新增强样本
+% 故障切换时，仅更新索引标志，不执行全局内存拷贝
+if fault_changed
+    last_fault_idx = fault_idx;
+end
+
+if load_chg || rpm_chg || fault_changed
+    % 负载 / 转速 / 故障类型 改变 → 重新插值基础信号并立即生成新增强样本
     last_load   = target_load;
     last_rpm    = target_rpm;
-    base_signal = compute_interp(sig_matrix, load_vec, rpm_vec, ...
+    % 传入 3D 张量和当前选定的故障层索引
+    base_signal = compute_interp(sig_tensor, fault_idx, load_vec, rpm_vec, ...
                       double(n_cond), target_load, target_rpm, ...
                       K_NEIGHBORS, IDW_POWER, SIGNAL_LEN, F, MAX_COND);
     cur_signal    = generate_aug(base_signal, SIGNAL_LEN, F);
@@ -101,7 +122,7 @@ elseif cur_ivl ~= last_interval
     % 到达下一个 0.5s 间隔 → 保持基础信号，生成新增强样本
     cur_signal    = generate_aug(base_signal, SIGNAL_LEN, F);
     last_interval = cur_ivl;
-    pkt_idx       = int32(0);  % 新样本从第 1 段开始发送
+    pkt_idx       = int32(0);
 end
 
 % 每次调用只输出一段 PACKET_LEN 点（顺序分片发送）
@@ -121,8 +142,8 @@ end  % ══ 主函数结束 ════════════════�
 %% ════════════════════════════════════════════════════════════
 %  辅助函数 1：Method B 基础插值（IDW + 谱幅度-相位解耦）
 %% ════════════════════════════════════════════════════════════
-function sig_out = compute_interp(sig_mat, lv, rv, nc, tl, tr, K, P, N, F, MCOND)
-%COMPUTE_INTERP  对给定工况 (tl, tr) 执行 IDW 加权频谱插值
+function sig_out = compute_interp(sig_tensor, fault_idx, lv, rv, nc, tl, tr, K, P, N, F, MCOND)
+%COMPUTE_INTERP  对给定工况 (tl, tr) 执行 IDW 加权频谱插值，按需提取 3D 数据
 
 % 归一化尺度（各轴最小正差值）
 ls = scale_of(lv, nc);
@@ -176,7 +197,16 @@ phs_im = zeros(1, F);
 
 for ki = 1:K
     if ki <= k_act
-        sp_full = fft(sig_mat(sel_idx(ki), :));
+        % =========================================================
+        % 【核心修改点】仅在计算 FFT 前，动态提取需要用到的 1024 个点
+        % =========================================================
+        r_idx = sel_idx(ki);
+        sig_1d = zeros(1, N);
+        for c = 1:N
+            sig_1d(c) = sig_tensor(fault_idx, r_idx, c);
+        end
+
+        sp_full = fft(sig_1d);
         sp_h    = sp_full(1:F);
         m_i     = abs(sp_h);
         u_i     = sp_h ./ (m_i + 1e-12);
@@ -203,18 +233,10 @@ end
 
 
 %% ════════════════════════════════════════════════════════════
-%  辅助函数 2：两阶段随机数据增强（对应 Python interpolate_hil.py）
+%  辅助函数 2：两阶段随机数据增强
 %% ════════════════════════════════════════════════════════════
 function aug = generate_aug(base, N, F)
 %GENERATE_AUG  对基础信号执行两阶段随机增强，每次调用产生不同样本
-%
-% Stage 1 – 频域增强（在复频谱上操作）:
-%   Step A: 谱包络调制 — 5控制点随机增益曲线（线性插值）× 复频谱
-%   Step B: 保功率相位抖动 — 各频点叠加 ±0.25 rad 随机噪声
-%
-% Stage 2 – 时域增强（在重建波形上操作）:
-%   Step C: 随机循环移位 + 幅度缩放
-%   Step D: SNR 控制高斯噪声注入（SNR 在 [15, 25] dB 随机选取）
 
 % ── Stage 1A: 谱包络调制 ─────────────────────────────────────
 N_CTRL    = 5;
@@ -224,7 +246,6 @@ GAIN_HIGH = 1.4;
 spec_full = fft(base);
 spec_h    = spec_full(1:F);
 
-% 生成 N_CTRL 个随机增益控制点，线性插值为逐频点增益曲线
 y_ctrl   = GAIN_LOW + (GAIN_HIGH - GAIN_LOW) * rand(1, N_CTRL);
 step_sz  = (double(F) - 1.0) / double(N_CTRL - 1);
 
@@ -251,7 +272,7 @@ JITTER_RAD = 0.25;
 mag_h      = abs(spec_h);
 phase_h    = atan2(imag(spec_h), real(spec_h));
 pnoise     = JITTER_RAD * (2.0 * rand(1, F) - 1.0);
-pnoise(1)  = 0.0;   % DC 相位不抖动
+pnoise(1)  = 0.0;
 spec_h     = mag_h .* exp(1j * (phase_h + pnoise));
 
 % IFFT → Stage 1 时域输出
