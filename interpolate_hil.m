@@ -11,7 +11,9 @@ function signal_out = interpolate_hil(target_load, target_rpm, fault_sel, t)
 %
 % 部署说明:
 %   数据通过 coder.const 在 Build 时嵌入目标机，Speedgoat 运行时无需访问文件。
-%   UDP 发送：将 signal_out 连接到 Simulink UDP Send 块即可，无需修改本函数。
+%   UDP 发送：将 signal_out 连接到 Simulink UDP Send 块；每包为 129×double（与 PC 端 receive_udp_hil.py 一致）:
+%            第 1 个 double = 当前真实类别标签（以 double 发送，PC 端转 int；此处为 0..N_FAULT-1）；
+%            后 128 个 double = 振动数据。UDP Send / Byte Pack 宽度须设为 129。
 %
 % 输入:
 %   target_load     - 目标负载值
@@ -19,12 +21,13 @@ function signal_out = interpolate_hil(target_load, target_rpm, fault_sel, t)
 %   fault_sel       - 故障类型：1=IF0_2，2=IF0_4，3=IF0_6（与 HIL_data.mat 变量名一致）
 %   t               - 仿真当前时间（来自 Clock 模块，单位：秒）
 % 输出:
-%   signal_out      - 1×PACKET_LEN 时域信号；每 REGEN_INTERVAL 秒刷新整个 1024 点样本，并从第 1 段重新按顺序输出
+%   signal_out      - 1×(1+128) 向量：标签 + 振动分片；1024 点仍分 8 包发出，每包带同一 GT 标签
 
 % ══ 配置参数（按需修改）══════════════════════════════════════
-SIGNAL_LEN      = 1024;   % 信号长度，须与 .mat 中实际一致
-PACKET_LEN      = 128;    % 每次 UDP 发送的数据点数量
-NUM_PACKETS     = int32(SIGNAL_LEN / PACKET_LEN); % 1024/128 = 8
+SIGNAL_LEN          = 1024;   % 信号长度，须与 .mat 中实际一致
+SAMPLES_PER_PACKET  = 128;    % 每包中振动采样点数
+PACKET_LEN          = 1 + SAMPLES_PER_PACKET;  % 1 标签 + 128 数据 = 129（与 receive_udp_hil 默认 DOUBLES_PER_PACKET 一致）
+NUM_PACKETS         = int32(SIGNAL_LEN / SAMPLES_PER_PACKET); % 1024/128 = 8
 MAX_COND        = 1500;   % 须 >= 实际工况数；与 pack_hil_for_coder / HIL_packed 行数一致
 N_FAULT         = 3;      % 打包的故障种类数，须与 pack_hil_for_coder 中 fault_list 一致
 PACKED_COLS     = SIGNAL_LEN;
@@ -40,7 +43,7 @@ REGEN_INTERVAL  = 0.5;    % 每隔多少秒生成新的增强样本（秒）
 persistent sig_tensor load_vec rpm_vec n_cond data_ready
 persistent base_signal cur_signal last_interval last_load last_rpm pkt_idx last_fault_idx
 
-% 默认输出（防止未赋值报错）
+% 默认输出（防止未赋值报错；长度与 UDP 包一致）
 signal_out = zeros(1, PACKET_LEN);
 F = floor(SIGNAL_LEN / 2) + 1;   % 单边谱长度
 
@@ -125,12 +128,15 @@ elseif cur_ivl ~= last_interval
     pkt_idx       = int32(0);
 end
 
-% 每次调用只输出一段 PACKET_LEN 点（顺序分片发送）
-idx_start = double(pkt_idx) * double(PACKET_LEN) + 1;
-for i = 1:PACKET_LEN
-    signal_out(i) = cur_signal(idx_start + i - 1);
+% 每次调用输出一包 UDP：[GT 标签 | 128 点振动]
+% 标签：fault_idx 为 1..N_FAULT（与 fault_sel 一致），发送 double(fault_idx-1) 供 PC 端作 0..num_classes-1
+signal_out = zeros(1, PACKET_LEN);
+signal_out(1) = double(fault_idx - 1);
+idx_start = double(pkt_idx) * double(SAMPLES_PER_PACKET) + 1;
+for i = 1:SAMPLES_PER_PACKET
+    signal_out(1 + i) = cur_signal(idx_start + i - 1);
 end
-% 下次调用输出下一段
+% 下次调用输出下一段（8 包凑满 1024 点振动，每包均带同一标签）
 pkt_idx = pkt_idx + 1;
 if pkt_idx >= NUM_PACKETS
     pkt_idx = int32(0);
