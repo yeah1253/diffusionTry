@@ -15,10 +15,17 @@ import torch.nn as nn
 BEARING_CNN_ARCH = "cnn1d_bearing_v1"
 
 
+def count_conv1d_layers(module: nn.Module) -> int:
+    """统计模块树中 nn.Conv1d 个数（用于实时性评估与日志）。"""
+    return sum(1 for m in module.modules() if isinstance(m, nn.Conv1d))
+
+
 class BearingCNN1D(nn.Module):
     """
     轻量 1D CNN，适合 1024 点轴承振动片段的十分类（或其它 K 类，由 num_classes 指定）。
-    结构: Conv-BN-ReLU-Pool × 3 + AdaptiveAvgPool1d + Linear。
+
+    卷积特征提取部分含 **4 个 Conv1d 层**（其后为 BN/ReLU/池化，最后 AdaptiveAvgPool1d + Linear）。
+    修改实时性时可减少 Conv1d 数量或通道数。
     """
 
     def __init__(self, num_classes: int = 10):
