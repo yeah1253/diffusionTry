@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-边缘实时诊断节点（双进程）：从 Speedgoat / Simulink 经 UDP 接收带标签的 1D 振动报文，
+边缘实时诊断节点（双进程）：从 Speedgoat / Simulink 经 UDP 接收带标签的 1D 振动报文。
+
+说明：离线 val/test 高而 UDP 准确率低，常见原因包括 (1) 目标机侧随机增强使分布偏离训练集；
+(2) 换类时推理端滑窗仍拼接旧类样本。请与 interpolate_hil.m 的 USE_RANDOM_AUGMENT_FOR_UDP 与本脚本
+GT 切换清空缓冲配合使用。
 由独立接收进程极速收包并打点，推理进程维护 1024 点缓冲、PyTorch 推理与多数投票，
 支持端到端延迟测评、准确率统计与 CSV 持久化。
 
@@ -13,6 +17,9 @@
 Simulink 侧需与 Byte Unpack [129] double 对齐。
 
 在 IDE 中直接点击 Run 即可；所有参数在下方「全局配置区」修改（无 argparse）。
+
+空闲退出：UDP_IDLE_TIMEOUT_SEC 秒内未收到「长度正确且解析成功并入队」的包时，接收进程停止并触发汇总，
+主进程打印平均诊断时间（端到端 ms）与平均诊断准确率后退出。
 """
 
 from __future__ import annotations
@@ -41,8 +48,8 @@ DOUBLES_PER_PACKET = 129
 SIGNAL_DOUBLES_PER_PACKET = 128  # 每包中振动点数（= DOUBLES_PER_PACKET - 1）
 LITTLE_ENDIAN = True
 
-# 接收 → 推理 之间的有界队列；满时丢弃最旧条目，优先保留最新数据（降低积压滞后）
-QUEUE_MAXSIZE = 50
+# 接收 → 推理 之间的有界队列；满时丢弃最旧条目。略小可降低排队导致的 E2E 尖峰与过时样本
+QUEUE_MAXSIZE = 24
 
 # 相对路径相对于本脚本所在目录解析
 MODEL_PATH = "best_model.pth"
@@ -56,9 +63,74 @@ DEVICE_STR = "cpu"
 SAVE_METRICS = True
 METRICS_FILE = "evaluation_results.csv"
 
+# 接收空闲超时：连续若干秒未收到「有效」UDP 包（长度正确且解析成功并入队）则结束运行并输出汇总
+UDP_IDLE_TIMEOUT_SEC = 5.0
+
 # =============================================================================
 # 工具函数
 # =============================================================================
+
+
+def fetch_stats_from_queue(stats_queue: Queue, retries: int = 40, sleep_s: float = 0.05) -> dict | None:
+    """推理进程退出后会 put 一条汇总；短暂轮询避免竞态。"""
+    for _ in range(retries):
+        try:
+            return stats_queue.get_nowait()
+        except queue.Empty:
+            time.sleep(sleep_s)
+    return None
+
+
+def print_session_summary(
+    stats: dict | None,
+    metrics_path: Path,
+    *,
+    reason: str,
+) -> None:
+    """
+    打印会话汇总：突出「平均诊断时间（端到端 ms）」与「平均诊断准确率」
+    （投票后的最终确诊准确率；若无投票记录则回退为单次窗准确率）。
+    """
+    print("\n" + "=" * 60)
+    print(f"[测评汇总] {reason}")
+    print("=" * 60)
+    if not stats or not stats.get("ok"):
+        err = stats.get("error", stats) if isinstance(stats, dict) else stats
+        print(f"  未能获取完整统计: {err}")
+        print("=" * 60 + "\n")
+        return
+
+    ti = int(stats["total_inferences"])
+    cs = int(stats["correct_single"])
+    nf = int(stats["n_final"])
+    cf = int(stats["correct_final"])
+    mean_lat = float(stats["mean_latency_ms"])
+
+    # 平均诊断准确率：优先「最终确诊」；尚无投票输出时用语义明确的单次窗准确率
+    if nf > 0:
+        diag_acc = cf / nf
+        diag_note = f"最终确诊 {cf}/{nf}"
+    else:
+        diag_acc = (cs / ti) if ti > 0 else 0.0
+        diag_note = f"单次推理 {cs}/{ti}（投票未满 {VOTE_WINDOW} 次，无最终确诊统计）"
+
+    print(f"  【平均诊断时间】   {mean_lat:.3f} ms（各次推理端到端延迟算术平均，共 {ti} 次）")
+    print(f"  【平均诊断准确率】 {diag_acc:.4f}（{diag_note}）")
+    print("  —— 明细 ——")
+    print(f"  总推理次数:        {ti}")
+    print(f"  单次预测准确率:    {cs}/{ti} = {(cs / ti if ti else 0):.4f}")
+    print(f"  最终确诊次数:      {nf}")
+    print(f"  最终确诊准确率:    {cf}/{nf} = {(cf / nf if nf else 0):.4f}")
+    print(f"  平均端到端延迟:    {mean_lat:.3f} ms")
+    mn, mx = stats.get("min_latency_ms"), stats.get("max_latency_ms")
+    if ti > 0 and mn is not None and mx is not None:
+        print(f"  最小端到端延迟:    {mn:.3f} ms")
+        print(f"  最大端到端延迟:    {mx:.3f} ms")
+    elif ti == 0:
+        print("  最小/最大延迟:     无推理记录")
+    if SAVE_METRICS:
+        print(f"  指标已写入:        {metrics_path.resolve()}")
+    print("=" * 60 + "\n")
 
 
 def unpack_labeled_packet(
@@ -109,6 +181,23 @@ def _make_dummy_classifier(num_classes: int):
 
 def DummyDiagnosticModel(num_classes: int = 2):
     return _make_dummy_classifier(num_classes)
+
+
+def num_classes_from_model(model) -> int | None:
+    """从已加载模块推断分类数，避免与 checkpoint 不一致。"""
+    try:
+        clf = getattr(model, "classifier", None)
+        if clf is not None and hasattr(clf, "out_features"):
+            return int(clf.out_features)
+        fc = getattr(model, "fc", None)
+        if fc is not None and hasattr(fc, "out_features"):
+            return int(fc.out_features)
+        nc = getattr(model, "num_classes", None)
+        if nc is not None:
+            return int(nc)
+    except (TypeError, ValueError):
+        pass
+    return None
 
 
 def load_diagnostic_model(model_path: str, num_classes: int):
@@ -286,10 +375,12 @@ def receiver_main(
     bind_ip: str,
     port: int,
     pkt_size: int,
+    idle_timeout_sec: float,
 ) -> None:
     """
     在刚执行完 socket.recvfrom 返回后的第一行记录 T_recv（perf_counter），
     再解析报文，将 (T_recv, label, signal_tuple) 送入队列。
+    若 idle_timeout_sec > 0：启动后或上一包「有效入队」后，连续超过该秒数无有效包则置 stop_event 并退出。
     """
     sock: socket.socket | None = None
     try:
@@ -301,15 +392,47 @@ def receiver_main(
             f"({DOUBLES_PER_PACKET} doubles)",
             flush=True,
         )
+        if idle_timeout_sec > 0:
+            print(
+                f"[接收进程] 空闲超时: 连续 {idle_timeout_sec:.1f}s 无有效 UDP 则自动停止。",
+                flush=True,
+            )
 
         # 上一包成功解析后的 GT；若本包 GT 与其不同则先清空 Queue（单生产者下 get_nowait 可排空）
         last_gt_label: int | None = None
+        recv_started_mono = time.monotonic()
+        last_valid_rx_mono: float | None = None
+
+        def _check_idle_exit() -> bool:
+            """若已超时返回 True（并已 set stop_event）。"""
+            if idle_timeout_sec <= 0:
+                return False
+            now = time.monotonic()
+            if last_valid_rx_mono is None:
+                if now - recv_started_mono >= idle_timeout_sec:
+                    print(
+                        f"[接收进程] 已超过 {idle_timeout_sec:.1f}s 未收到任何有效 UDP，停止接收。",
+                        flush=True,
+                    )
+                    stop_event.set()
+                    return True
+            else:
+                if now - last_valid_rx_mono >= idle_timeout_sec:
+                    print(
+                        f"[接收进程] 已连续 {idle_timeout_sec:.1f}s 未收到有效 UDP，停止接收。",
+                        flush=True,
+                    )
+                    stop_event.set()
+                    return True
+            return False
 
         while not stop_event.is_set():
             try:
                 sock.settimeout(0.3)
                 data, addr = sock.recvfrom(65535)
             except socket.timeout:
+                if _check_idle_exit():
+                    break
                 continue
             except OSError as e:
                 if stop_event.is_set():
@@ -325,12 +448,16 @@ def receiver_main(
                     f"[接收进程] 来自 {addr} 包长 {len(data)} != {pkt_size}，跳过。",
                     file=sys.stderr,
                 )
+                if _check_idle_exit():
+                    break
                 continue
 
             try:
                 label_int, signal = unpack_labeled_packet(data, DOUBLES_PER_PACKET, LITTLE_ENDIAN)
             except ValueError as e:
                 print(f"[接收进程] 解析失败 {addr}: {e}", file=sys.stderr)
+                if _check_idle_exit():
+                    break
                 continue
 
             # 若与上一 UDP 包的真实标签不一致，丢弃 Queue 内全部待处理数据，再入队本包
@@ -348,8 +475,11 @@ def receiver_main(
             item = (t_recv, label_int, signal)
             try:
                 put_queue_drop_oldest(pkt_queue, item)
+                last_valid_rx_mono = time.monotonic()
             except Exception as e:
                 print(f"[接收进程] 入队异常: {e}", file=sys.stderr)
+                if _check_idle_exit():
+                    break
 
     except Exception as e:
         print(f"[接收进程] 未捕获异常: {e}", file=sys.stderr)
@@ -399,6 +529,16 @@ def _inference_worker_with_stats(
         stats_queue.put({"ok": False, "error": "model is None"})
         return
 
+    inferred_nc = num_classes_from_model(model)
+    if inferred_nc is not None and inferred_nc != num_classes:
+        print(
+            f"[推理进程] 分类数以模型为准: num_classes={inferred_nc}（全局配置为 {num_classes}）",
+            flush=True,
+        )
+        num_classes = inferred_nc
+    elif inferred_nc is not None:
+        num_classes = inferred_nc
+
     try:
         import torch
 
@@ -410,6 +550,7 @@ def _inference_worker_with_stats(
     sample_buf: deque[float] = deque()
     vote_q: deque[int] = deque(maxlen=VOTE_WINDOW)
     last_final: int | None = None
+    last_gt_consumer: int | None = None
 
     total_inferences = 0
     correct_single = 0
@@ -467,6 +608,24 @@ def _inference_worker_with_stats(
                 break
 
             try:
+                # GT 变化时清空滑窗与投票：否则 1024 点会跨故障拼接，与训练「单类连续采样」不一致
+                gt_clamped = max(0, min(num_classes - 1, int(gt_label)))
+                if last_gt_consumer is not None and gt_clamped != last_gt_consumer:
+                    sample_buf.clear()
+                    vote_q.clear()
+                    last_final = None
+                    print(
+                        f"[推理进程] GT {last_gt_consumer} -> {gt_clamped}，已清空样本滑窗与投票状态。",
+                        flush=True,
+                    )
+                last_gt_consumer = gt_clamped
+
+                if gt_label != gt_clamped:
+                    print(
+                        f"[推理进程] 标签 {gt_label} 越界，已钳制为 {gt_clamped}。",
+                        file=sys.stderr,
+                    )
+
                 # 当前队列元素对应「本 UDP 包」的 T_recv / 标签；128 点并入缓冲。
                 # 当本次 extend 后首次满足 len>=1024 时，视为该包「触发」本次推理，端到端起点取本包 T_recv。
                 sample_buf.extend(signal)
@@ -484,12 +643,6 @@ def _inference_worker_with_stats(
                     record_latency_ms(t_done - t_recv)
 
                     total_inferences += 1
-                    gt_clamped = max(0, min(num_classes - 1, gt_label))
-                    if gt_label != gt_clamped:
-                        print(
-                            f"[推理进程] 标签 {gt_label} 越界，已钳制为 {gt_clamped}。",
-                            file=sys.stderr,
-                        )
                     if pred == gt_clamped:
                         correct_single += 1
 
@@ -579,7 +732,7 @@ def main() -> int:
 
     recv_proc = Process(
         target=receiver_main,
-        args=(pkt_queue, stop_event, BIND_IP, UDP_PORT, pkt_size),
+        args=(pkt_queue, stop_event, BIND_IP, UDP_PORT, pkt_size, UDP_IDLE_TIMEOUT_SEC),
         name="UDPReceiver",
         daemon=False,
     )
@@ -602,19 +755,21 @@ def main() -> int:
     print(
         f"[主进程] {datetime.now():%Y-%m-%d %H:%M:%S} 启动闭环测评 | "
         f"队列容量={QUEUE_MAXSIZE}（满则丢最旧）| "
-        f"每包 {DOUBLES_PER_PACKET} doubles（1 标签 + {SIGNAL_DOUBLES_PER_PACKET} 信号）"
+        f"每包 {DOUBLES_PER_PACKET} doubles（1 标签 + {SIGNAL_DOUBLES_PER_PACKET} 信号）| "
+        f"空闲≥{UDP_IDLE_TIMEOUT_SEC:.1f}s 无有效 UDP 则自动退出"
     )
 
+    user_interrupt = False
     try:
         recv_proc.start()
         inf_proc.start()
 
-        # 主进程阻塞等待，Ctrl+C 触发 KeyboardInterrupt
         while recv_proc.is_alive() or inf_proc.is_alive():
             recv_proc.join(timeout=0.5)
             inf_proc.join(timeout=0.5)
 
     except KeyboardInterrupt:
+        user_interrupt = True
         print("\n[主进程] KeyboardInterrupt，正在停止子进程…", file=sys.stderr)
         stop_event.set()
         recv_proc.join(timeout=3.0)
@@ -626,49 +781,33 @@ def main() -> int:
         recv_proc.join(timeout=2.0)
         inf_proc.join(timeout=2.0)
 
-        # 汇总报告（推理进程退出前已 put 一份 stats；若被 terminate 可能无数据）
-        stats = None
-        for _ in range(20):
-            try:
-                stats = stats_queue.get_nowait()
-                break
-            except queue.Empty:
-                time.sleep(0.05)
-        if stats is None:
-            stats = {"ok": False, "error": "无统计（进程可能被强制结束或尚未写入）"}
-
-        print("\n" + "=" * 60)
-        print("[测评汇总] 会话结束")
-        print("=" * 60)
-        if stats.get("ok"):
-            ti = int(stats["total_inferences"])
-            cs = int(stats["correct_single"])
-            nf = int(stats["n_final"])
-            cf = int(stats["correct_final"])
-            print(f"  总推理次数:        {ti}")
-            print(f"  单次预测准确率:    {cs}/{ti} = {(cs / ti if ti else 0):.4f}")
-            print(f"  最终确诊次数:      {nf}")
-            print(f"  最终确诊准确率:    {cf}/{nf} = {(cf / nf if nf else 0):.4f}")
-            print(f"  平均端到端延迟:    {stats['mean_latency_ms']:.3f} ms")
-            mn, mx = stats.get("min_latency_ms"), stats.get("max_latency_ms")
-            if ti > 0 and mn is not None and mx is not None:
-                print(f"  最小端到端延迟:    {mn:.3f} ms")
-                print(f"  最大端到端延迟:    {mx:.3f} ms")
-            elif ti == 0:
-                print("  最小/最大延迟:     无推理记录")
-            if SAVE_METRICS:
-                print(f"  指标已写入:        {metrics_path.resolve()}")
-        else:
-            print(f"  未能获取完整统计: {stats.get('error', stats)}")
-        print("=" * 60 + "\n")
-
     except Exception as e:
         print(f"[主进程] 异常: {e}", file=sys.stderr)
         stop_event.set()
-        recv_proc.terminate()
-        inf_proc.terminate()
+        try:
+            recv_proc.terminate()
+            inf_proc.terminate()
+            recv_proc.join(timeout=2.0)
+            inf_proc.join(timeout=2.0)
+        except Exception:
+            pass
+        stats_err = fetch_stats_from_queue(stats_queue)
+        if stats_err is None:
+            stats_err = {"ok": False, "error": str(e)}
+        print_session_summary(stats_err, metrics_path, reason="主进程异常退出")
         return 1
 
+    if user_interrupt:
+        summary_reason = "用户中断 (KeyboardInterrupt)"
+    else:
+        summary_reason = (
+            f"已连续 ≥{UDP_IDLE_TIMEOUT_SEC:.1f}s 未收到有效 UDP，接收进程已停止（或子进程已正常结束）"
+        )
+
+    stats = fetch_stats_from_queue(stats_queue)
+    if stats is None:
+        stats = {"ok": False, "error": "无统计（进程可能被强制结束或推理尚未写入汇总）"}
+    print_session_summary(stats, metrics_path, reason=summary_reason)
     return 0
 
 

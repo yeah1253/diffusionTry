@@ -11,6 +11,8 @@ function signal_out = interpolate_hil(target_load, target_rpm, fault_sel, t)
 %
 % 部署说明:
 %   数据通过 coder.const 在 Build 时嵌入目标机，Speedgoat 运行时无需访问文件。
+%   【分布对齐】离线训练数据多为「原始/滤波」波形；若 USE_RANDOM_AUGMENT_FOR_UDP=true，每步随机增强
+%   会使 UDP 分布与训练集严重偏离，PC 端准确率会显著低于 val/test。部署诊断建议置为 false，仅发插值基信号。
 %   UDP 发送：将 signal_out 连接到 Simulink UDP Send 块；每包为 129×double（与 PC 端 receive_udp_hil.py 一致）:
 %            第 1 个 double = 当前真实类别标签（以 double 发送，PC 端转 int；此处为 0..N_FAULT-1）；
 %            后 128 个 double = 振动数据。UDP Send / Byte Pack 宽度须设为 129。
@@ -29,14 +31,16 @@ SAMPLES_PER_PACKET  = 128;    % 每包中振动采样点数
 PACKET_LEN          = 1 + SAMPLES_PER_PACKET;  % 1 标签 + 128 数据 = 129（与 receive_udp_hil 默认 DOUBLES_PER_PACKET 一致）
 NUM_PACKETS         = int32(SIGNAL_LEN / SAMPLES_PER_PACKET); % 1024/128 = 8
 MAX_COND        = 1500;   % 须 >= 实际工况数；与 pack_hil_for_coder / HIL_packed 行数一致
-N_FAULT         = 3;      % 打包的故障种类数，须与 pack_hil_for_coder 中 fault_list 一致
+N_FAULT         = 10;      % 打包的故障种类数，须与 pack_hil_for_coder 中 fault_list 一致
 PACKED_COLS     = SIGNAL_LEN;
 if (MAX_COND + 1) > PACKED_COLS
     PACKED_COLS = MAX_COND + 1;   % 行1需列 1..(MAX_COND+1) 放 n_cond 与 load_vec
 end
 K_NEIGHBORS     = 6;      % IDW 最近邻数量
 IDW_POWER       = 2.0;    % IDW 距离衰减指数
-REGEN_INTERVAL  = 0.5;    % 每隔多少秒生成新的增强样本（秒）
+REGEN_INTERVAL  = 0.5;    % 每隔多少秒刷新 cur_signal（仅当 USE_RANDOM_AUGMENT_FOR_UDP=true 时有随机性）
+% false=UDP 发送 IDW 插值后的 base_signal（推荐，贴近 HIL_train/.npy 与训练分布）；true=原 generate_aug 强随机增强
+USE_RANDOM_AUGMENT_FOR_UDP = false;
 
 % ══ Persistent 缓存 ══════════════════════════════════════════
 % 注意：已移除占用极大的 sig_matrix 缓存
@@ -89,7 +93,11 @@ if isempty(data_ready)
         base_signal = compute_interp(sig_tensor, fault_idx, load_vec, rpm_vec, ...
                           double(n_cond), target_load, target_rpm, ...
                           K_NEIGHBORS, IDW_POWER, SIGNAL_LEN, F, MAX_COND);
-        cur_signal    = generate_aug(base_signal, SIGNAL_LEN, F);
+        if USE_RANDOM_AUGMENT_FOR_UDP
+            cur_signal = generate_aug(base_signal, SIGNAL_LEN, F);
+        else
+            cur_signal = base_signal;
+        end
         last_interval = floor(t / REGEN_INTERVAL);
     end
 end
@@ -117,13 +125,21 @@ if load_chg || rpm_chg || fault_changed
     base_signal = compute_interp(sig_tensor, fault_idx, load_vec, rpm_vec, ...
                       double(n_cond), target_load, target_rpm, ...
                       K_NEIGHBORS, IDW_POWER, SIGNAL_LEN, F, MAX_COND);
-    cur_signal    = generate_aug(base_signal, SIGNAL_LEN, F);
+    if USE_RANDOM_AUGMENT_FOR_UDP
+        cur_signal = generate_aug(base_signal, SIGNAL_LEN, F);
+    else
+        cur_signal = base_signal;
+    end
     last_interval = cur_ivl;
     pkt_idx       = int32(0);  % 新样本从第 1 段开始发送
 
 elseif cur_ivl ~= last_interval
-    % 到达下一个 0.5s 间隔 → 保持基础信号，生成新增强样本
-    cur_signal    = generate_aug(base_signal, SIGNAL_LEN, F);
+    % 到达下一个时间间隔：有增强则重新随机；无增强则重复发送当前 base（由 load/rpm 未变时 base 未重算）
+    if USE_RANDOM_AUGMENT_FOR_UDP
+        cur_signal = generate_aug(base_signal, SIGNAL_LEN, F);
+    else
+        cur_signal = base_signal;
+    end
     last_interval = cur_ivl;
     pkt_idx       = int32(0);
 end
