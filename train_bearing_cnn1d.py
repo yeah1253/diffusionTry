@@ -49,8 +49,12 @@ DATA_ROOT = r"D:\data\轴承数据集"
 WINDOW_SIZE = 1024  # 与 Speedgoat / receive_udp_hil 推理窗长一致
 STRIDE = 1024  # 滑窗步长；1024 与在线非重叠分片一致；可改小以增加窗数
 
-# 输出到脚本同目录，供 receive_udp_hil.py 加载（按「验证集最优」保存，部署更合理）
-OUTPUT_MODEL_PATH = "best_model.pth"
+# 诊断模型架构选择（影响 train / train_two_models 两种模式）
+# 可选值: "cnn" | "lstm" | "transformer" | "rf"
+MODEL_TYPE = "cnn"
+
+# 输出文件名（自动含模型类型后缀，便于多架构对比实验并排保存）
+OUTPUT_MODEL_PATH = f"best_model_{MODEL_TYPE}.pth"
 EXPECTED_NUM_CLASSES = 10  # 一级类别文件夹数不等于此时仅警告，仍以实际为准
 
 # 每个 .npy 文件最多使用的滑窗样本数（避免单文件扫满导致过拟合）
@@ -80,9 +84,9 @@ NORMALIZE_PER_WINDOW = True
 # 生成数据根目录（结构与 DATA_ROOT 一致：GEN_DATA_ROOT/类别/load_X/rpm_Y/filtered_*.npy）
 GEN_DATA_ROOT = str(Path(__file__).resolve().parent / "generated_grid_train")
 
-# 两个输出模型文件名（保存在脚本同目录）
-OUTPUT_MODEL_PATH_MIXED = "model_mixed.pth"       # 模型1：真实+生成混合
-OUTPUT_MODEL_PATH_REAL_ONLY = "model_real_only.pth"  # 模型2：仅真实数据
+# 两个输出模型文件名（保存在脚本同目录；自动含模型类型后缀）
+OUTPUT_MODEL_PATH_MIXED     = f"model_mixed_{MODEL_TYPE}.pth"     # 模型1：真实+生成混合
+OUTPUT_MODEL_PATH_REAL_ONLY = f"model_real_only_{MODEL_TYPE}.pth" # 模型2：仅真实数据
 
 # 工况区域定义（用于计算混合比例）
 # 核心区：CORE_RPM ± 任意，负载 [CORE_LOAD_LO, CORE_LOAD_HI]
@@ -386,7 +390,7 @@ def train() -> int:
         print("[错误] 需要 PyTorch: pip install torch", file=sys.stderr)
         return 1
 
-    from bearing_models import BEARING_CNN_ARCH, BearingCNN1D, count_conv1d_layers
+    from model import arch_name, build_model, count_feature_layers
 
     root = Path(DATA_ROOT)
     index, class_names = build_window_index_wrapped(root)
@@ -408,6 +412,16 @@ def train() -> int:
         f"[信息] 划分说明: 每类先取约 {TEST_RATIO:.0%} 作测试集；"
         f"余下按 {TRAIN_IN_TRAINVAL:.0%}:{1 - TRAIN_IN_TRAINVAL:.0%} 分为训练/验证。"
     )
+
+    # ── 随机森林分支 ──
+    if MODEL_TYPE.lower() == "rf":
+        out_path = SCRIPT_DIR / OUTPUT_MODEL_PATH
+        test_acc = train_rf_model(
+            train_list, class_names, out_path, "单模型-RF", cache, test_list
+        )
+        print(f"\n[完成] RF 单模型已保存: {out_path.resolve()} | 测试集准确率: {test_acc:.4f}")
+        return 0
+
     if len(val_list) == 0:
         print(
             "[错误] 验证集为空（每类仅 1 个窗口时会出现）。请增大 MAX_WINDOWS_PER_FILE、减小 STRIDE 或合并类别。",
@@ -454,10 +468,10 @@ def train() -> int:
         collate_fn=collate,
     )
 
-    model = BearingCNN1D(num_classes=num_classes).to(device)
-    n_conv = count_conv1d_layers(model)
+    model = build_model(MODEL_TYPE, num_classes).to(device)
+    n_layers = count_feature_layers(model)
     print(
-        f"[模型] BearingCNN1D 中 **Conv1d 卷积层数 = {n_conv}**（实时性：层数/通道越少通常越快；当前为 4 层卷积 + 分类头 Linear）。"
+        f"[模型] {type(model).__name__} | 特征提取层数={n_layers} | MODEL_TYPE={MODEL_TYPE}"
     )
 
     opt = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
@@ -494,7 +508,7 @@ def train() -> int:
             best_val_acc = val_acc
             patience_cnt = 0
             ckpt = {
-                "architecture": BEARING_CNN_ARCH,
+                "architecture": arch_name(MODEL_TYPE),
                 "state_dict": model.state_dict(),
                 "num_classes": num_classes,
                 "class_names": class_names,
@@ -890,6 +904,122 @@ def build_mixed_and_real_only_indices(
     return mixed_idx, real_only_idx, shared_test_idx, class_names
 
 
+# =============================================================================
+# RF 专用辅助函数
+# =============================================================================
+
+
+def _materialize_windows_for_rf(
+    index: list,
+    cache: dict[str, np.ndarray],
+) -> "tuple[np.ndarray, np.ndarray]":
+    """
+    将窗口索引 [(path, start, label), ...] 实体化为特征矩阵 X 和标签向量 y。
+    每个窗口先经 NORMALIZE_PER_WINDOW 处理，再用 extract_rf_features 提取 26 维特征。
+    """
+    from model import extract_rf_features
+
+    X_list: list = []
+    y_list: list = []
+
+    for path, start, label in index:
+        path = Path(path)
+        key  = str(path.resolve())
+        if key not in cache:
+            try:
+                if path.suffix.lower() == ".mat":
+                    cache[key] = _load_signal_from_mat(path)
+                else:
+                    cache[key] = load_signal_from_npy(path)
+            except Exception as e:
+                print(f"  [RF跳过] {path.name}: {e}", file=sys.stderr)
+                continue
+        sig = cache[key]
+        if len(sig) < start + WINDOW_SIZE:
+            continue
+        w = sig[start: start + WINDOW_SIZE].astype(np.float32)
+        if NORMALIZE_PER_WINDOW:
+            m = float(w.mean())
+            s = float(w.std()) + 1e-6
+            w = (w - m) / s
+        X_list.append(extract_rf_features(w))
+        y_list.append(label)
+
+    if not X_list:
+        return np.empty((0, 26), dtype=np.float64), np.empty(0, dtype=np.int64)
+    return (
+        np.array(X_list, dtype=np.float64),
+        np.array(y_list, dtype=np.int64),
+    )
+
+
+def train_rf_model(
+    train_index: list,
+    class_names: list[str],
+    out_path: Path,
+    model_label: str,
+    cache: dict,
+    test_index: list | None = None,
+) -> float:
+    """
+    用随机森林在给定索引上训练并保存 checkpoint。
+
+    RF 无早停/验证集，直接在全量训练集上 fit；
+    测试集准确率由 test_index 提供（通常为共用纯真实测试集）。
+
+    返回测试集准确率（无 test_index 时返回训练集准确率）。
+    """
+    import torch
+
+    try:
+        from sklearn.ensemble import RandomForestClassifier
+    except ImportError:
+        print("[错误] 随机森林需要 scikit-learn: pip install scikit-learn", file=sys.stderr)
+        return 0.0
+
+    from model import ARCH_RF, BearingRFWrapper
+
+    num_classes = len(class_names)
+    print(f"\n[{model_label}] 正在提取 RF 特征（训练集 {len(train_index)} 窗口）…")
+    X_train, y_train = _materialize_windows_for_rf(train_index, cache)
+    if len(y_train) == 0:
+        print(f"[{model_label}] 训练集为空，跳过。", file=sys.stderr)
+        return 0.0
+
+    print(f"[{model_label}] 训练集: {X_train.shape[0]} 样本 × {X_train.shape[1]} 特征")
+    rf = RandomForestClassifier(n_estimators=200, n_jobs=-1, random_state=SEED)
+    rf.fit(X_train, y_train)
+    train_acc = float((rf.predict(X_train) == y_train).mean())
+    print(f"[{model_label}] 训练集准确率: {train_acc:.4f}")
+
+    test_acc = train_acc
+    if test_index:
+        print(f"[{model_label}] 正在提取 RF 特征（测试集 {len(test_index)} 窗口）…")
+        X_test, y_test = _materialize_windows_for_rf(test_index, cache)
+        if len(y_test) > 0:
+            test_acc = float((rf.predict(X_test) == y_test).mean())
+            print(f"[{model_label}] 测试集准确率: {test_acc:.4f}")
+
+    wrapper = BearingRFWrapper(rf, num_classes)
+    ckpt = {
+        "architecture":        ARCH_RF,
+        "rf_wrapper":          wrapper,
+        "num_classes":         num_classes,
+        "class_names":         class_names,
+        "window_size":         WINDOW_SIZE,
+        "normalize_per_window": NORMALIZE_PER_WINDOW,
+        "model_type":          model_label,
+    }
+    torch.save(ckpt, str(out_path))
+    print(f"[{model_label}] 已保存: {out_path.resolve()}")
+    return test_acc
+
+
+# =============================================================================
+# PyTorch 通用单模型训练
+# =============================================================================
+
+
 def train_one_model(
     index: list,
     class_names: list[str],
@@ -900,7 +1030,8 @@ def train_one_model(
     shared_test_index: list | None = None,
 ) -> float:
     """
-    从给定窗口索引训练 BearingCNN1D，以验证集最优权重保存到 out_path。
+    从给定窗口索引训练指定架构（MODEL_TYPE）的模型，以验证集最优权重保存到 out_path。
+    RF 请直接调用 train_rf_model()，本函数仅处理 PyTorch 模型。
 
     参数
     ----
@@ -914,7 +1045,7 @@ def train_one_model(
     from torch import nn
     from torch.utils.data import DataLoader
 
-    from bearing_models import BEARING_CNN_ARCH, BearingCNN1D, count_conv1d_layers
+    from model import arch_name, build_model, count_feature_layers
 
     num_classes = len(class_names)
 
@@ -962,10 +1093,10 @@ def train_one_model(
         ds_test, batch_size=BATCH_SIZE, shuffle=False, num_workers=0, collate_fn=collate
     )
 
-    model = BearingCNN1D(num_classes=num_classes).to(device)
-    n_conv = count_conv1d_layers(model)
+    model = build_model(MODEL_TYPE, num_classes).to(device)
+    n_layers = count_feature_layers(model)
     print(
-        f"[{model_label}] BearingCNN1D: Conv1d×{n_conv} | "
+        f"[{model_label}] {type(model).__name__} | 特征提取层数={n_layers} | "
         f"设备: {device} | epochs上限: {EPOCHS} | 早停: {EARLY_STOP_PATIENCE}"
     )
 
@@ -999,15 +1130,15 @@ def train_one_model(
             best_val_acc = val_acc
             patience_cnt = 0
             ckpt = {
-                "architecture": BEARING_CNN_ARCH,
-                "state_dict": model.state_dict(),
-                "num_classes": num_classes,
-                "class_names": class_names,
-                "window_size": WINDOW_SIZE,
+                "architecture":        arch_name(MODEL_TYPE),
+                "state_dict":          model.state_dict(),
+                "num_classes":         num_classes,
+                "class_names":         class_names,
+                "window_size":         WINDOW_SIZE,
                 "normalize_per_window": NORMALIZE_PER_WINDOW,
-                "best_val_acc": best_val_acc,
-                "epoch": epoch + 1,
-                "model_type": model_label,
+                "best_val_acc":        best_val_acc,
+                "epoch":               epoch + 1,
+                "model_type":          model_label,
             }
             torch.save(ckpt, str(out_path))
             print(
@@ -1072,6 +1203,8 @@ def train_two_models() -> int:
         print("[错误] 需要 PyTorch: pip install torch", file=sys.stderr)
         return 1
 
+    from model import N_FEATURE_LAYERS
+
     device = torch.device(DEVICE if torch.cuda.is_available() else "cpu")
     if device.type == "cpu" and DEVICE == "cuda":
         print("[警告] CUDA 不可用，使用 CPU 训练。")
@@ -1100,28 +1233,44 @@ def train_two_models() -> int:
 
     cache: dict[str, np.ndarray] = {}
     out_mixed = SCRIPT_DIR / OUTPUT_MODEL_PATH_MIXED
-    out_real = SCRIPT_DIR / OUTPUT_MODEL_PATH_REAL_ONLY
+    out_real  = SCRIPT_DIR / OUTPUT_MODEL_PATH_REAL_ONLY
+
+    use_rf = MODEL_TYPE.lower() == "rf"
+    tag    = f"[{MODEL_TYPE.upper()}]"
 
     print(f"\n{'='*60}")
-    print(f"[模型1] 真实+生成混合模型 -> {out_mixed.name}")
+    print(f"{tag}[模型1] 真实+生成混合模型 -> {out_mixed.name}")
     print(f"{'='*60}")
     set_seed(SEED)
-    acc_mixed = train_one_model(
-        mixed_idx, class_names, out_mixed, "模型1-混合", device, cache,
-        shared_test_index=shared_test_idx,
-    )
+    if use_rf:
+        acc_mixed = train_rf_model(
+            mixed_idx, class_names, out_mixed, "模型1-混合-RF", cache,
+            test_index=shared_test_idx,
+        )
+    else:
+        acc_mixed = train_one_model(
+            mixed_idx, class_names, out_mixed, "模型1-混合", device, cache,
+            shared_test_index=shared_test_idx,
+        )
 
     print(f"\n{'='*60}")
-    print(f"[模型2] 纯真实数据模型 -> {out_real.name}")
+    print(f"{tag}[模型2] 纯真实数据模型 -> {out_real.name}")
     print(f"{'='*60}")
     set_seed(SEED)
-    acc_real = train_one_model(
-        real_only_idx, class_names, out_real, "模型2-真实", device, cache,
-        shared_test_index=shared_test_idx,
-    )
+    if use_rf:
+        acc_real = train_rf_model(
+            real_only_idx, class_names, out_real, "模型2-真实-RF", cache,
+            test_index=shared_test_idx,
+        )
+    else:
+        acc_real = train_one_model(
+            real_only_idx, class_names, out_real, "模型2-真实", device, cache,
+            shared_test_index=shared_test_idx,
+        )
 
     print(f"\n{'='*60}")
     print(f"  双模型训练完成（两模型使用相同的纯真实测试集，共 {len(shared_test_idx)} 条）")
+    print(f"  模型架构: {MODEL_TYPE.upper()} | 特征提取层数: {N_FEATURE_LAYERS if not use_rf else 'N/A（随机森林）'}")
     print(f"{'='*60}")
     print(f"  模型1（混合）测试准确率: {acc_mixed:.4f}  ({acc_mixed*100:.2f}%)")
     print(f"           路径: {out_mixed.resolve()}")
@@ -1147,8 +1296,6 @@ def eval_only() -> int:
     except ImportError:
         print("[错误] 需要 PyTorch: pip install torch", file=sys.stderr)
         return 1
-
-    from bearing_models import BearingCNN1D
 
     root = Path(DATA_ROOT)
     index, class_names = build_window_index_wrapped(root)
@@ -1207,7 +1354,9 @@ def eval_only() -> int:
         )
         return 1
 
-    model = BearingCNN1D(num_classes=num_classes).to(device)
+    from model import build_model
+    arch_ck = ck.get("architecture", "cnn1d_bearing_v1")
+    model = build_model(arch_ck, num_classes).to(device)
     model.load_state_dict(ck["state_dict"])
 
     test_acc = evaluate_accuracy(model, dl_test, device)

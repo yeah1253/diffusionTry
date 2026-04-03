@@ -205,7 +205,12 @@ def num_classes_from_model(model) -> int | None:
 
 
 def load_diagnostic_model(model_path: str, num_classes: int):
-    """在**当前进程**内加载模型（子进程须各自调用，勿跨进程传递 nn.Module）。"""
+    """
+    在**当前进程**内加载模型（子进程须各自调用，勿跨进程传递 nn.Module）。
+
+    支持从 model.py 导出的全部架构（CNN / LSTM / Transformer / RF），
+    也兼容仅用 bearing_models.py 保存的旧版 CNN checkpoint。
+    """
     try:
         import torch
         import torch.nn as nn
@@ -213,11 +218,23 @@ def load_diagnostic_model(model_path: str, num_classes: int):
         print("[错误] 未安装 PyTorch，请执行: pip install torch", file=sys.stderr)
         return None
 
+    # 尝试导入新架构模块（model.py）
     try:
-        from bearing_models import BEARING_CNN_ARCH, BearingCNN1D
+        from model import (
+            ARCH_CNN, ARCH_LSTM, ARCH_TRANSFORMER, ARCH_RF,
+            build_model, BearingRFWrapper,
+        )
+        _model_ok = True
+    except ImportError:
+        _model_ok = False
+        ARCH_CNN = ARCH_LSTM = ARCH_TRANSFORMER = ARCH_RF = None  # type: ignore
+
+    # 保留旧版 bearing_models.py 兼容（BEARING_CNN_ARCH = "cnn1d_bearing_v1"）
+    try:
+        from bearing_models import BEARING_CNN_ARCH, BearingCNN1D as _LegacyCNN
     except ImportError:
         BEARING_CNN_ARCH = None  # type: ignore
-        BearingCNN1D = None  # type: ignore
+        _LegacyCNN = None       # type: ignore
 
     path = resolve_model_path(model_path)
     if not path.is_file():
@@ -237,6 +254,7 @@ def load_diagnostic_model(model_path: str, num_classes: int):
         m.eval()
         return m
 
+    # ── 直接存储的 nn.Module ──
     if isinstance(obj, nn.Module):
         obj.to(DEVICE_STR)
         obj.eval()
@@ -245,22 +263,46 @@ def load_diagnostic_model(model_path: str, num_classes: int):
 
     if isinstance(obj, dict):
         arch = obj.get("architecture")
-        if (
-            BearingCNN1D is not None
-            and BEARING_CNN_ARCH is not None
-            and arch == BEARING_CNN_ARCH
-            and "state_dict" in obj
-        ):
-            nc = int(obj.get("num_classes", num_classes))
-            m = BearingCNN1D(num_classes=nc)
-            m.load_state_dict(obj["state_dict"], strict=True)
-            m.to(DEVICE_STR)
-            m.eval()
-            names = obj.get("class_names")
-            print(f"[信息] 已加载轴承 CNN1D checkpoint: {path} | num_classes={nc}")
+        nc   = int(obj.get("num_classes", num_classes))
+        names = obj.get("class_names")
+
+        # ── 随机森林 ──
+        if _model_ok and arch == ARCH_RF and "rf_wrapper" in obj:
+            wrapper = obj["rf_wrapper"]
+            print(f"[信息] 已加载 RandomForest checkpoint: {path} | num_classes={nc}")
             if names:
                 print(f"[信息] 类别顺序: {names}")
-            return m
+            return wrapper
+
+        # ── PyTorch 神经网络（CNN / LSTM / Transformer）──
+        if "state_dict" in obj:
+            try:
+                if _model_ok and arch in (ARCH_CNN, ARCH_LSTM, ARCH_TRANSFORMER):
+                    m = build_model(arch, nc)
+                elif _LegacyCNN is not None and arch == BEARING_CNN_ARCH:
+                    # 兼容旧版 bearing_models.py 保存的 CNN checkpoint
+                    m = _LegacyCNN(num_classes=nc)
+                else:
+                    print(
+                        f"[警告] 未知架构 {arch!r}，尝试退回 CNN。",
+                        file=sys.stderr,
+                    )
+                    if _model_ok:
+                        m = build_model("cnn", nc)
+                    else:
+                        m = DummyDiagnosticModel(num_classes=nc)
+                        m.eval()
+                        return m
+
+                m.load_state_dict(obj["state_dict"], strict=True)
+                m.to(DEVICE_STR)
+                m.eval()
+                print(f"[信息] 已加载 {arch} checkpoint: {path} | num_classes={nc}")
+                if names:
+                    print(f"[信息] 类别顺序: {names}")
+                return m
+            except Exception as e:
+                print(f"[警告] 加载 state_dict 失败: {e}，改用占位模型。", file=sys.stderr)
 
         if "model" in obj and isinstance(obj["model"], nn.Module):
             m = obj["model"]
@@ -268,6 +310,7 @@ def load_diagnostic_model(model_path: str, num_classes: int):
             m.eval()
             print(f"[信息] 已从 checkpoint 字段 'model' 加载: {path}")
             return m
+
         print("[警告] checkpoint dict 无法识别，改用占位模型。", file=sys.stderr)
 
     m = DummyDiagnosticModel(num_classes=num_classes)
@@ -278,6 +321,7 @@ def load_diagnostic_model(model_path: str, num_classes: int):
 def run_single_inference(model, chunk: list[float], device_str: str) -> int:
     import numpy as np
     import torch
+    import torch.nn as nn
 
     if len(chunk) != POINTS_PER_INFERENCE:
         raise ValueError(f"chunk 长度应为 {POINTS_PER_INFERENCE}，实际 {len(chunk)}")
@@ -287,16 +331,21 @@ def run_single_inference(model, chunk: list[float], device_str: str) -> int:
         arr = (arr - float(arr.mean())) / (float(arr.std()) + 1e-6)
 
     x = torch.from_numpy(arr).to(device=device_str)
-    x = x.unsqueeze(0).unsqueeze(0)
+    x = x.unsqueeze(0).unsqueeze(0)   # (1, 1, L)
 
-    with torch.no_grad():
+    if isinstance(model, nn.Module):
+        # PyTorch 神经网络（CNN / LSTM / Transformer）
+        with torch.no_grad():
+            out = model(x)
+    else:
+        # 非 nn.Module 可调用对象（如 BearingRFWrapper），不需要 no_grad 上下文
         out = model(x)
 
-    if out.dim() == 0:
-        return int(out.item())
-    if out.dim() >= 2:
+    if isinstance(out, torch.Tensor):
+        if out.dim() == 0:
+            return int(out.item())
         return int(out.argmax(dim=-1).item())
-    return int(out.item())
+    return int(out)
 
 
 def majority_vote(recent_preds: list[int], tie_fallback: int | None) -> tuple[int, bool]:
