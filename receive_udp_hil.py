@@ -51,8 +51,12 @@ LITTLE_ENDIAN = True
 # 接收 → 推理 之间的有界队列；满时丢弃最旧条目。略小可降低排队导致的 E2E 尖峰与过时样本
 QUEUE_MAXSIZE = 24
 
-# 相对路径相对于本脚本所在目录解析
-MODEL_PATH = "best_model.pth"
+# 模型选择：从 train_bearing_cnn1d.py 双模型训练生成的两个文件中选一个
+#   "model_mixed.pth"     — 模型1：真实+生成数据混合（核心区 1:1，边缘区 1:9）
+#   "model_real_only.pth" — 模型2：纯真实数据（数量与混合模型中真实数据相同）
+#   "best_model.pth"      — 原有单模型训练输出（--single 模式）
+# 修改下方 MODEL_PATH 切换模型。
+MODEL_PATH = "model_mixed.pth"
 NUM_CLASSES = 10
 
 NORMALIZE_PER_WINDOW = True
