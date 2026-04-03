@@ -78,7 +78,7 @@ NORMALIZE_PER_WINDOW = True
 # =============================================================================
 
 # 生成数据根目录（结构与 DATA_ROOT 一致：GEN_DATA_ROOT/类别/load_X/rpm_Y/filtered_*.npy）
-GEN_DATA_ROOT = str(Path(__file__).resolve().parent / "generated_samples_cvae")
+GEN_DATA_ROOT = str(Path(__file__).resolve().parent / "generated_grid_train")
 
 # 两个输出模型文件名（保存在脚本同目录）
 OUTPUT_MODEL_PATH_MIXED = "model_mixed.pth"       # 模型1：真实+生成混合
@@ -677,6 +677,10 @@ def _compute_real_count(rpm: int, load: int) -> int:
     return max(0, min(TOTAL_WINDOWS_PER_CONDITION, real_count))
 
 
+# 生成数据目录中不应载入训练集的元数据文件名
+_GEN_SKIP_FILES = {"kl_scores.npy", "selected_idx.npy", "all_generated.npy"}
+
+
 def _collect_windows_by_condition(
     class_dir: Path,
     label: int,
@@ -687,7 +691,10 @@ def _collect_windows_by_condition(
     每个文件最多取 MAX_WINDOWS_PER_FILE 个滑窗。
 
     .mat  — SDUST/Simulink 长序列，按 STRIDE 滑窗（真实数据）
-    .npy  — 单样本，通常给出 1 个 1024 点窗（生成数据）
+    .npy  — 单样本，通常给出 1 个 1024 点窗（生成数据，filtered_0.npy…）
+
+    _GEN_SKIP_FILES 中列出的文件名（kl_scores.npy / selected_idx.npy /
+    all_generated.npy）为生成过程元数据，自动跳过，不进入训练集。
 
     返回 {(load, rpm): [(file_path, start, label), ...]}
     """
@@ -700,6 +707,8 @@ def _collect_windows_by_condition(
     )
 
     for file_path in all_files:
+        if file_path.name in _GEN_SKIP_FILES:
+            continue
         rpm, load = _parse_condition_from_path(file_path)
         cond_key = (load if load is not None else -1, rpm if rpm is not None else -1)
 
@@ -797,16 +806,13 @@ def build_mixed_and_real_only_indices(
 
     for folder_name, label in class_list:
         real_class_dir = root_real / folder_name
-        # 生成数据目录按类别索引命名：class_0, class_1, ...
-        # 与真实数据按排序顺序对应（IF0.2→class_0, NC→class_3, ...）
-        gen_class_dir = (root_gen / f"class_{label}") if gen_available else None
+        # 生成数据目录与真实数据目录同名（IF0.2, NC, OF0.2, ...）
+        gen_class_dir = (root_gen / folder_name) if gen_available else None
 
         real_by_cond = _collect_windows_by_condition(real_class_dir, label, rng)
-        gen_by_cond = (
-            _collect_windows_by_condition(gen_class_dir, label, rng)
-            if gen_class_dir is not None and gen_class_dir.is_dir()
-            else {}
-        )
+        gen_by_cond: dict = {}
+        if gen_class_dir is not None and gen_class_dir.is_dir():
+            gen_by_cond = _collect_windows_by_condition(gen_class_dir, label, rng)
 
         all_conds = set(real_by_cond.keys()) | set(gen_by_cond.keys())
         total_real_cls = 0
