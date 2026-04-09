@@ -14,11 +14,12 @@ function packed = hil_get_const_data(max_cond, signal_len, packed_cols, n_fault)
 S = coder.load('HIL_packed_for_codegen.mat');
 packed = S.hil_packed;
 
+% assert message must be ASCII-only for Simulink Coder (GBK codegen issue with CJK)
 if size(packed, 1) ~= n_fault * (max_cond + 2)
-    assert(false, 'hil_packed 行数应为 n_fault*(max_cond+2)，请与 interpolate_hil 中 MAX_COND 对齐');
+    assert(false);
 end
 if size(packed, 2) ~= packed_cols
-    assert(false, 'hil_packed 列数应与 PACKED_COLS 一致');
+    assert(false);
 end
 
 end

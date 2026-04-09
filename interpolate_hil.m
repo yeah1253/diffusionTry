@@ -12,6 +12,7 @@ function signal_out = interpolate_hil(target_load, target_rpm, fault_sel, t)
 %   - 打包后：同一 (load,rpm) 对应多行（如 filtered0..filtered14），load_vec/rpm_vec 相同；
 %   - 用归一化欧氏距离找离 (target_load, target_rpm) 最近的点；最小距离上的所有行并列；
 %   - 在并列行中 uniform 随机选一行 → 即在该工况格内随机选一条 filtered 样本；
+%   - 每条 1024 分 8 包发完后，在工况与故障不变时再次在同格并列行中随机选一条（不重复循环同一条）；
 %   - UDP 输出格式不变：1 标签 + 128 点/包，共 8 包凑满 1024。
 %
 % UDP 发送：将 signal_out 连接到 Simulink UDP Send 块；每包为 129×double（与 PC 端 receive_udp_hil.py 一致）:
@@ -24,7 +25,8 @@ function signal_out = interpolate_hil(target_load, target_rpm, fault_sel, t)
 %   fault_sel       - 故障类型 1..N_FAULT，顺序与 pack_hil_for_coder 的 fault_list 一致（默认 10 类）
 %   t               - 仿真当前时间（来自 Clock 模块，单位：秒）
 % 输出:
-%   signal_out      - 1×(1+128) 向量：标签 + 振动分片；1024 点分 8 包发出，每包带同一 GT 标签
+%   signal_out      - 1×(1+128) 向量：标签 + 振动分片；1024 点分 8 包发出，每包带同一 GT 标签；
+%                   发满 8 包后换同工况下另一条随机样本，负载/转速/fault_sel 变化时亦重新选样并重置包序
 
 % ══ 配置参数（按需修改）══════════════════════════════════════
 SIGNAL_LEN          = 1024;
@@ -112,6 +114,9 @@ end
 pkt_idx = pkt_idx + 1;
 if pkt_idx >= NUM_PACKETS
     pkt_idx = int32(0);
+    % 发满一条 1024 后，工况与故障未变时也在最近格内再随机选一条，避免无限重复同一样本
+    cur_signal = pick_random_nearest_signal(sig_tensor, fault_idx, load_vec, rpm_vec, ...
+        double(n_cond), target_load, target_rpm, SIGNAL_LEN, MAX_COND);
 end
 
 end
