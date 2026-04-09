@@ -56,7 +56,7 @@ QUEUE_MAXSIZE = 24
 #   "model_real_only.pth" — 模型2：纯真实数据（数量与混合模型中真实数据相同）
 #   "best_model.pth"      — 原有单模型训练输出（--single 模式）
 # 修改下方 MODEL_PATH 切换模型。
-MODEL_PATH = "model_mixed.pth"
+MODEL_PATH = "model_real_only_cnn.pth"
 NUM_CLASSES = 10
 
 NORMALIZE_PER_WINDOW = True
