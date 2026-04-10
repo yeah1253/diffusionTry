@@ -258,53 +258,110 @@ class BearingTCN(nn.Module):
 
 
 # =============================================================================
-# 模型 4：BearingMobileNet1D — 深度可分离卷积（轻量化边缘部署）
+# 模型 4：BearingMobileNet1D — 超轻量反转残差网络（MobileNetV2-1D 重设计版）
 # =============================================================================
 
-class _DSConv1d(nn.Module):
-    """深度可分离卷积块（Depthwise + Pointwise + BN + ReLU6）。"""
+class _InvResBlock1D(nn.Module):
+    """
+    MobileNetV2 反转残差块（1D）。
+
+    结构：PW 扩张 → BN → ReLU6 → DW(k,s) → BN → ReLU6 → PW 投影 → BN
+    stride=1 且 in_ch==out_ch 时添加残差连接；stride=2 时无残差。
+
+    与传统 DSConv 的区别：
+      - 先把通道数扩张 t 倍，让 DW 在高维空间做特征提取；
+      - 再用 PW 无激活投影回目标通道，减少信息损失；
+      - 梯度流更顺畅，精度/参数比更优。
+    """
 
     def __init__(self, in_ch: int, out_ch: int,
-                 kernel_size: int = 3, stride: int = 1):
+                 stride: int = 1, expand_ratio: int = 4, dw_kernel: int = 5):
         super().__init__()
-        pad = kernel_size // 2
-        self.dw  = nn.Conv1d(in_ch, in_ch, kernel_size, stride=stride,
-                              padding=pad, groups=in_ch, bias=False)
-        self.pw  = nn.Conv1d(in_ch, out_ch, 1, bias=False)
-        self.bn  = nn.BatchNorm1d(out_ch)
-        self.act = nn.ReLU6(inplace=True)
+        mid_ch = in_ch * expand_ratio
+        pad    = dw_kernel // 2
+        self.conv = nn.Sequential(
+            # 1. PW 扩张：升通道，增加特征多样性
+            nn.Conv1d(in_ch, mid_ch, 1, bias=False),
+            nn.BatchNorm1d(mid_ch), nn.ReLU6(inplace=True),
+            # 2. DW 时序卷积：轻量捕捉局部振动特征（k=5 覆盖范围更广）
+            nn.Conv1d(mid_ch, mid_ch, dw_kernel, stride=stride,
+                      padding=pad, groups=mid_ch, bias=False),
+            nn.BatchNorm1d(mid_ch), nn.ReLU6(inplace=True),
+            # 3. PW 投影：降回目标通道，无激活（保持线性，V2 核心设计）
+            nn.Conv1d(mid_ch, out_ch, 1, bias=False),
+            nn.BatchNorm1d(out_ch),
+        )
+        # stride=1 且通道一致时才加残差，否则维度不匹配
+        self.use_skip = (stride == 1 and in_ch == out_ch)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.act(self.bn(self.pw(self.dw(x))))
+        out = self.conv(x)
+        return out + x if self.use_skip else out
 
 
 class BearingMobileNet1D(nn.Module):
     """
-    轻量化 MobileNet-1D，4 个深度可分离卷积块，参数量约 CNN 的 1/8。
-    Stem Conv(stride=2) → DS×4 → AdaptiveAvgPool → 分类头。
+    超轻量 MobileNet-1D v2（反转残差重设计版），专为 HIL 实时诊断优化。
+
+    相对旧版的核心改进：
+      ① Stem 改用 k=9、stride=4，一步将 1024→256，大幅削减后续层的 MAC 数；
+      ② 引入 MobileNetV2 反转残差块（PW扩张→DW→PW投影），精度/速度比优于 DSConv；
+      ③ 通道上限从 256 降至 48，末层通道数减少 5×，逐点卷积代价大幅下降；
+      ④ 取消冗余的 stride=1 等维块（原 Block3），改为 3 个全部含 stride=2 的块；
+      ⑤ DW 卷积核升至 5，在较小通道数下维持足够的局部感受野。
+
+    结构：
+      Stem  — Conv(k=9, s=4) → BN → ReLU6          [1024→256, ch:1→16]
+      Block1 — IR(16→24, s=2, t=4, dk=5)             [256→128]
+      Block2 — IR(24→32, s=2, t=4, dk=5)             [128→64]
+      Block3 — IR(32→48, s=2, t=4, dk=5)             [64→32]
+      GAP + Dropout(0.1) + Linear(48→C)
+
+    参数量 ≈ 21K  （旧版 ≈ 65K，减少 ~3×）
+    MAC 数  ≈ 旧版的 25%
+    感受野  ≈ 93 个输入点（足够覆盖轴承故障特征周期）
 
     输入:  (B, 1, L=1024)
     输出:  (B, num_classes) logits
     """
 
+    # ── 超参（可按需修改，无需改动训练脚本）────────────────────────────────────
+    _CHANNELS     = [16, 24, 32, 48]   # Stem + 3 个 IR 块的输出通道
+    _EXPAND_RATIO = 4                   # PW 扩张倍数（MobileNetV2 标准为 6，此处用 4 更轻）
+    _DW_KERNEL    = 5                   # DW 卷积核大小（3 → 5，感受野更大）
+    _STEM_KERNEL  = 9                   # Stem 大核，增强初始特征提取
+    _STEM_STRIDE  = 4                   # Stem 大步长，快速压缩序列
+    _DROPOUT      = 0.10                # 分类头前 Dropout，防轻量模型过拟合
+
     def __init__(self, num_classes: int = 10):
         super().__init__()
         self.num_classes = num_classes
+        c = self._CHANNELS             # [16, 24, 32, 48]
+
+        # Stem：大核（k=9）保证初始感受野，大步长（s=4）快速压缩 1024→256
         self.stem = nn.Sequential(
-            nn.Conv1d(1, 32, kernel_size=3, stride=2, padding=1, bias=False),
-            nn.BatchNorm1d(32), nn.ReLU6(inplace=True),
+            nn.Conv1d(1, c[0], kernel_size=self._STEM_KERNEL,
+                      stride=self._STEM_STRIDE,
+                      padding=self._STEM_KERNEL // 2, bias=False),
+            nn.BatchNorm1d(c[0]), nn.ReLU6(inplace=True),
         )
+        # 3 个反转残差块：每块 stride=2，序列长度 256→128→64→32
         self.blocks = nn.Sequential(
-            _DSConv1d(32,  64,  stride=2),   # Layer 1
-            _DSConv1d(64,  128, stride=2),   # Layer 2
-            _DSConv1d(128, 128, stride=1),   # Layer 3
-            _DSConv1d(128, 256, stride=2),   # Layer 4
+            _InvResBlock1D(c[0], c[1], stride=2,
+                           expand_ratio=self._EXPAND_RATIO, dw_kernel=self._DW_KERNEL),
+            _InvResBlock1D(c[1], c[2], stride=2,
+                           expand_ratio=self._EXPAND_RATIO, dw_kernel=self._DW_KERNEL),
+            _InvResBlock1D(c[2], c[3], stride=2,
+                           expand_ratio=self._EXPAND_RATIO, dw_kernel=self._DW_KERNEL),
         )
         self.pool       = nn.AdaptiveAvgPool1d(1)
-        self.classifier = nn.Linear(256, num_classes)
+        self.drop       = nn.Dropout(self._DROPOUT)    # 防止小模型过拟合
+        self.classifier = nn.Linear(c[3], num_classes)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.classifier(self.pool(self.blocks(self.stem(x))).squeeze(-1))
+        x = self.stem(x)                               # (B, 16, 256)
+        x = self.blocks(x)                             # (B, 48,  32)
+        return self.classifier(self.drop(self.pool(x).squeeze(-1)))
 
 
 # =============================================================================
@@ -754,11 +811,12 @@ _HPARAMS: dict[str, dict] = {
         epochs=250, patience=20,
         warmup_epochs=5,  grad_clip=1.0,  label_smoothing=0.05,
     ),
-    # ── MobileNet-1D：轻量模型，收敛接近 CNN ──────────────────────────────────
+    # ── MobileNet-1D v2（反转残差重设计版）：参数量 ~21K，训练策略接近 CNN ─────
+    # 模型更小 → 适当提高 lr 和 patience，防止欠拟合；小 warmup 帮助反转残差稳定初期
     ARCH_MOBILENET: dict(
-        lr=8e-4,    weight_decay=4e-4,   batch_size=64,
-        epochs=200, patience=15,
-        warmup_epochs=0,  grad_clip=0.0,  label_smoothing=0.05,
+        lr=1e-3,    weight_decay=2e-4,   batch_size=64,
+        epochs=200, patience=20,
+        warmup_epochs=3,  grad_clip=0.0,  label_smoothing=0.05,
     ),
     # ── ResNet-1D：比 CNN 更深，warmup + clip 有助稳定梯度流 ──────────────────
     ARCH_RESNET: dict(
@@ -813,7 +871,7 @@ def count_feature_layers(model: nn.Module) -> int:
       CNN1D       → Conv1d 层数（4）
       Transformer → Encoder 层数（4）
       TCN         → 扩张残差块数（4）
-      MobileNet   → DS-Conv 块数（4）
+      MobileNet   → 反转残差块数（3）
       ResNet1D    → 残差块数（4）
       ShuffleNet  → 全部 ShuffleBlock 总数（stage1+2+3 = 2+3+4 = 9）
       Conformer   → CNN 层数 + Transformer Encoder 层数（2+4 = 6）
