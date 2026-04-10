@@ -6,7 +6,7 @@
   BearingCNN1D       — 4 层标准 1D-CNN（基线，旧 checkpoint 可直接加载）
   BearingTransformer — 4 层 Patch-ViT Transformer Encoder（全局注意力）
   BearingTCN         — 4 层扩张残差 TCN（dilation=4^i，感受野≈1021）
-  BearingMobileNet1D — 4 层深度可分离卷积（轻量化，约 CNN 的 1/8 参数量）
+  BearingMobileNet1D — 2 块无扩张 DSConv（超轻量，推理算子数与 CNN 持平）
   BearingResNet1D    — 4 块残差网络（Skip Connection + BN，深层表达力强）
   BearingShuffleNet1D— 3 阶段 ShuffleNet V2（分组卷积+通道洗牌，HIL 低延迟）
   BearingConformer   — CNN×2 + Transformer×4 混合（局部降噪→全局周期识别）
@@ -32,7 +32,7 @@ import torch.nn as nn
 # 修改此处切换架构；train_bearing_cnn1d.py 会自动读取。
 # =============================================================================
 
-SelectModel: str = "conformer"
+SelectModel: str = "mobilenet"
 """全局架构选择，可选值：
   "cnn"         — BearingCNN1D（标准 1D-CNN，推荐基线）
   "transformer" — BearingTransformer（Patch-ViT Encoder）
@@ -258,109 +258,89 @@ class BearingTCN(nn.Module):
 
 
 # =============================================================================
-# 模型 4：BearingMobileNet1D — 超轻量反转残差网络（MobileNetV2-1D 重设计版）
+# 模型 4：BearingMobileNet1D — 超轻量深度可分离卷积网络（v3 极简版）
 # =============================================================================
 
-class _InvResBlock1D(nn.Module):
+class _DSConvBlock1D(nn.Module):
     """
-    MobileNetV2 反转残差块（1D）。
+    无扩张深度可分离卷积块（1D）。
 
-    结构：PW 扩张 → BN → ReLU6 → DW(k,s) → BN → ReLU6 → PW 投影 → BN
-    stride=1 且 in_ch==out_ch 时添加残差连接；stride=2 时无残差。
-
-    与传统 DSConv 的区别：
-      - 先把通道数扩张 t 倍，让 DW 在高维空间做特征提取；
-      - 再用 PW 无激活投影回目标通道，减少信息损失；
-      - 梯度流更顺畅，精度/参数比更优。
+    结构：DW(k, s) → BN → ReLU6 → PW(1×1) → BN → ReLU6
+    共 2 Conv + 2 BN，比反转残差块（3 Conv + 3 BN）少 1/3 串行算子，
+    中间张量无需扩张，内存带宽开销更小，推理延迟更低。
     """
 
     def __init__(self, in_ch: int, out_ch: int,
-                 stride: int = 1, expand_ratio: int = 4, dw_kernel: int = 5):
+                 stride: int = 1, dw_kernel: int = 3):
         super().__init__()
-        mid_ch = in_ch * expand_ratio
-        pad    = dw_kernel // 2
-        self.conv = nn.Sequential(
-            # 1. PW 扩张：升通道，增加特征多样性
-            nn.Conv1d(in_ch, mid_ch, 1, bias=False),
-            nn.BatchNorm1d(mid_ch), nn.ReLU6(inplace=True),
-            # 2. DW 时序卷积：轻量捕捉局部振动特征（k=5 覆盖范围更广）
-            nn.Conv1d(mid_ch, mid_ch, dw_kernel, stride=stride,
-                      padding=pad, groups=mid_ch, bias=False),
-            nn.BatchNorm1d(mid_ch), nn.ReLU6(inplace=True),
-            # 3. PW 投影：降回目标通道，无激活（保持线性，V2 核心设计）
-            nn.Conv1d(mid_ch, out_ch, 1, bias=False),
-            nn.BatchNorm1d(out_ch),
+        self.dw = nn.Sequential(
+            nn.Conv1d(in_ch, in_ch, dw_kernel, stride=stride,
+                      padding=dw_kernel // 2, groups=in_ch, bias=False),
+            nn.BatchNorm1d(in_ch), nn.ReLU6(inplace=True),
         )
-        # stride=1 且通道一致时才加残差，否则维度不匹配
-        self.use_skip = (stride == 1 and in_ch == out_ch)
+        self.pw = nn.Sequential(
+            nn.Conv1d(in_ch, out_ch, 1, bias=False),
+            nn.BatchNorm1d(out_ch), nn.ReLU6(inplace=True),
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = self.conv(x)
-        return out + x if self.use_skip else out
+        return self.pw(self.dw(x))
 
 
 class BearingMobileNet1D(nn.Module):
     """
-    超轻量 MobileNet-1D v2（反转残差重设计版），专为 HIL 实时诊断优化。
+    超极简 MobileNet-1D v3（无扩张深度可分离卷积），专为 HIL 在线诊断优化。
 
-    相对旧版的核心改进：
-      ① Stem 改用 k=9、stride=4，一步将 1024→256，大幅削减后续层的 MAC 数；
-      ② 引入 MobileNetV2 反转残差块（PW扩张→DW→PW投影），精度/速度比优于 DSConv；
-      ③ 通道上限从 256 降至 48，末层通道数减少 5×，逐点卷积代价大幅下降；
-      ④ 取消冗余的 stride=1 等维块（原 Block3），改为 3 个全部含 stride=2 的块；
-      ⑤ DW 卷积核升至 5，在较小通道数下维持足够的局部感受野。
+    v3 相对 v2（反转残差版）的核心改进：
+      ① 去掉 PW 升维步骤，每块从 3×Conv 降至 2×Conv，减少 ~33% 串行算子；
+      ② 从 3 块缩为 2 块，进一步缩短推理路径；
+      ③ Block1 步长升至 4（256→64），减少后续层的序列长度开销；
+      ④ DW 核从 5 降至 3，DW 计算量减少 40%；
+      ⑤ 总串行算子：5 Conv + 5 BN，与 CNN（4 Conv + 4 BN）基本持平，
+         但 DW 卷积实际 MAC 远低于标准卷积，综合延迟应低于 CNN。
 
     结构：
-      Stem  — Conv(k=9, s=4) → BN → ReLU6          [1024→256, ch:1→16]
-      Block1 — IR(16→24, s=2, t=4, dk=5)             [256→128]
-      Block2 — IR(24→32, s=2, t=4, dk=5)             [128→64]
-      Block3 — IR(32→48, s=2, t=4, dk=5)             [64→32]
-      GAP + Dropout(0.1) + Linear(48→C)
+      Stem  — Conv(k=9, s=4)  → BN → ReLU6   [1024→256, ch:1→24]
+      Block1 — DSConv(24→48, s=4, dk=3)        [256→64]
+      Block2 — DSConv(48→64, s=2, dk=3)        [64→32]
+      GAP + Dropout(0.1) + Linear(64→C)
 
-    参数量 ≈ 21K  （旧版 ≈ 65K，减少 ~3×）
-    MAC 数  ≈ 旧版的 25%
-    感受野  ≈ 93 个输入点（足够覆盖轴承故障特征周期）
+    参数量 ≈ 5.5K（v2 ≈ 21K，CNN ≈ 258K）
+    注意：v3 架构与 v2 不兼容，旧 checkpoint 需重新训练。
 
     输入:  (B, 1, L=1024)
     输出:  (B, num_classes) logits
     """
 
-    # ── 超参（可按需修改，无需改动训练脚本）────────────────────────────────────
-    _CHANNELS     = [16, 24, 32, 48]   # Stem + 3 个 IR 块的输出通道
-    _EXPAND_RATIO = 4                   # PW 扩张倍数（MobileNetV2 标准为 6，此处用 4 更轻）
-    _DW_KERNEL    = 5                   # DW 卷积核大小（3 → 5，感受野更大）
-    _STEM_KERNEL  = 9                   # Stem 大核，增强初始特征提取
-    _STEM_STRIDE  = 4                   # Stem 大步长，快速压缩序列
-    _DROPOUT      = 0.10                # 分类头前 Dropout，防轻量模型过拟合
+    _CHANNELS    = [24, 48, 64]   # Stem + 2 块的输出通道
+    _DW_KERNEL   = 3              # DW 核（k=3 比 k=5 快 40%，感受野已足够）
+    _STEM_KERNEL = 9              # Stem 大核，保证初始时频感受野
+    _STEM_STRIDE = 4              # Stem 大步长，快速将 1024 压缩至 256
+    _DROPOUT     = 0.10           # 分类头前 Dropout，防小模型过拟合
 
     def __init__(self, num_classes: int = 10):
         super().__init__()
         self.num_classes = num_classes
-        c = self._CHANNELS             # [16, 24, 32, 48]
+        c = self._CHANNELS   # [24, 48, 64]
 
-        # Stem：大核（k=9）保证初始感受野，大步长（s=4）快速压缩 1024→256
         self.stem = nn.Sequential(
             nn.Conv1d(1, c[0], kernel_size=self._STEM_KERNEL,
                       stride=self._STEM_STRIDE,
                       padding=self._STEM_KERNEL // 2, bias=False),
             nn.BatchNorm1d(c[0]), nn.ReLU6(inplace=True),
         )
-        # 3 个反转残差块：每块 stride=2，序列长度 256→128→64→32
+        # 2 个 DSConv 块：1024→256(stem)→64(s=4)→32(s=2)
         self.blocks = nn.Sequential(
-            _InvResBlock1D(c[0], c[1], stride=2,
-                           expand_ratio=self._EXPAND_RATIO, dw_kernel=self._DW_KERNEL),
-            _InvResBlock1D(c[1], c[2], stride=2,
-                           expand_ratio=self._EXPAND_RATIO, dw_kernel=self._DW_KERNEL),
-            _InvResBlock1D(c[2], c[3], stride=2,
-                           expand_ratio=self._EXPAND_RATIO, dw_kernel=self._DW_KERNEL),
+            _DSConvBlock1D(c[0], c[1], stride=4, dw_kernel=self._DW_KERNEL),
+            _DSConvBlock1D(c[1], c[2], stride=2, dw_kernel=self._DW_KERNEL),
         )
         self.pool       = nn.AdaptiveAvgPool1d(1)
-        self.drop       = nn.Dropout(self._DROPOUT)    # 防止小模型过拟合
-        self.classifier = nn.Linear(c[3], num_classes)
+        self.drop       = nn.Dropout(self._DROPOUT)
+        self.classifier = nn.Linear(c[2], num_classes)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.stem(x)                               # (B, 16, 256)
-        x = self.blocks(x)                             # (B, 48,  32)
+        x = self.stem(x)    # (B, 24, 256)
+        x = self.blocks(x)  # (B, 64,  32)
         return self.classifier(self.drop(self.pool(x).squeeze(-1)))
 
 
@@ -811,12 +791,12 @@ _HPARAMS: dict[str, dict] = {
         epochs=250, patience=20,
         warmup_epochs=5,  grad_clip=1.0,  label_smoothing=0.05,
     ),
-    # ── MobileNet-1D v2（反转残差重设计版）：参数量 ~21K，训练策略接近 CNN ─────
-    # 模型更小 → 适当提高 lr 和 patience，防止欠拟合；小 warmup 帮助反转残差稳定初期
+    # ── MobileNet-1D v3（无扩张 DSConv，参数量 ~5.5K）────────────────────────
+    # 模型极小，需适当提高 lr 防欠拟合；patience=25 给足收敛时间；无需 warmup
     ARCH_MOBILENET: dict(
-        lr=1e-3,    weight_decay=2e-4,   batch_size=64,
-        epochs=200, patience=20,
-        warmup_epochs=3,  grad_clip=0.0,  label_smoothing=0.05,
+        lr=1.5e-3,  weight_decay=1e-4,   batch_size=64,
+        epochs=200, patience=25,
+        warmup_epochs=0,  grad_clip=0.0,  label_smoothing=0.05,
     ),
     # ── ResNet-1D：比 CNN 更深，warmup + clip 有助稳定梯度流 ──────────────────
     ARCH_RESNET: dict(
@@ -871,7 +851,7 @@ def count_feature_layers(model: nn.Module) -> int:
       CNN1D       → Conv1d 层数（4）
       Transformer → Encoder 层数（4）
       TCN         → 扩张残差块数（4）
-      MobileNet   → 反转残差块数（3）
+      MobileNet   → DSConv 块数（2）
       ResNet1D    → 残差块数（4）
       ShuffleNet  → 全部 ShuffleBlock 总数（stage1+2+3 = 2+3+4 = 9）
       Conformer   → CNN 层数 + Transformer Encoder 层数（2+4 = 6）
