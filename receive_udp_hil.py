@@ -51,12 +51,25 @@ LITTLE_ENDIAN = True
 # 接收 → 推理 之间的有界队列；满时丢弃最旧条目。略小可降低排队导致的 E2E 尖峰与过时样本
 QUEUE_MAXSIZE = 24
 
-# 模型选择：从 train_bearing_cnn1d.py 双模型训练生成的两个文件中选一个
-#   "model_mixed.pth"     — 模型1：真实+生成数据混合（核心区 1:1，边缘区 1:9）
-#   "model_real_only.pth" — 模型2：纯真实数据（数量与混合模型中真实数据相同）
-#   "best_model.pth"      — 原有单模型训练输出（--single 模式）
-# 修改下方 MODEL_PATH 切换模型。
-MODEL_PATH = "model_real_only_cnn.pth"
+# ── ★ 架构选择 ★ ───────────────────────────────────────────────────────────────
+# 与 model.py 中的 SelectModel 完全对应，修改此处即可切换在线诊断网络：
+#   "cnn"         — BearingCNN1D        标准 1D-CNN（基线，推理最快）
+#   "transformer" — BearingTransformer  Patch-ViT Encoder（全局注意力）
+#   "tcn"         — BearingTCN          扩张残差 TCN（dilation=4^i）
+#   "mobilenet"   — BearingMobileNet1D  深度可分离卷积（轻量化，边缘部署）
+#   "resnet"      — BearingResNet1D     残差网络（深层表达力强）
+#   "shufflenet"  — BearingShuffleNet1D ShuffleNet V2（HIL 低延迟优先）
+#   "conformer"   — BearingConformer    CNN+Transformer 混合（推荐高精度）
+SelectModel = "cnn"
+
+# ── ★ 权重选择 ★ ───────────────────────────────────────────────────────────────
+# 对应 train_bearing_cnn1d.py 双模型训练生成的两个文件：
+#   "mixed"     — model_mixed_<架构>.pth     模型1：真实+生成混合（核心工况精度高）
+#   "real_only" — model_real_only_<架构>.pth  模型2：纯真实（可对比边缘工况性能差距）
+UseModel = "mixed"
+
+# 由 SelectModel + UseModel 自动推导模型文件路径（如需手动指定完整路径直接赋值即可）
+MODEL_PATH = f"model_{UseModel}_{SelectModel}.pth"
 NUM_CLASSES = 10
 
 NORMALIZE_PER_WINDOW = True
@@ -218,16 +231,14 @@ def load_diagnostic_model(model_path: str, num_classes: int):
         print("[错误] 未安装 PyTorch，请执行: pip install torch", file=sys.stderr)
         return None
 
-    # 尝试导入新架构模块（model.py）
+    # 尝试导入新架构模块（model.py v3：支持 CNN/Transformer/TCN/MobileNet/ResNet/ShuffleNet/Conformer）
     try:
-        from model import (
-            ARCH_CNN, ARCH_LSTM, ARCH_TRANSFORMER, ARCH_RF,
-            build_model, BearingRFWrapper,
-        )
+        from model import build_model, BearingRFWrapper, ARCH_RF, _ARCH_ALIASES
         _model_ok = True
     except ImportError:
-        _model_ok = False
-        ARCH_CNN = ARCH_LSTM = ARCH_TRANSFORMER = ARCH_RF = None  # type: ignore
+        _model_ok    = False
+        ARCH_RF      = None   # type: ignore
+        _ARCH_ALIASES = {}    # type: ignore
 
     # 保留旧版 bearing_models.py 兼容（BEARING_CNN_ARCH = "cnn1d_bearing_v1"）
     try:
@@ -274,10 +285,11 @@ def load_diagnostic_model(model_path: str, num_classes: int):
                 print(f"[信息] 类别顺序: {names}")
             return wrapper
 
-        # ── PyTorch 神经网络（CNN / LSTM / Transformer）──
+        # ── PyTorch 神经网络（CNN / Transformer / TCN / MobileNet / ResNet / ShuffleNet / Conformer）──
         if "state_dict" in obj:
             try:
-                if _model_ok and arch in (ARCH_CNN, ARCH_LSTM, ARCH_TRANSFORMER):
+                if _model_ok and arch is not None and arch in _ARCH_ALIASES:
+                    # 通用路径：build_model 支持 model.py 中全部已注册架构
                     m = build_model(arch, nc)
                 elif _LegacyCNN is not None and arch == BEARING_CNN_ARCH:
                     # 兼容旧版 bearing_models.py 保存的 CNN checkpoint
@@ -806,8 +818,9 @@ def main() -> int:
     )
 
     print(
-        f"[主进程] {datetime.now():%Y-%m-%d %H:%M:%S} 启动闭环测评 | "
-        f"队列容量={QUEUE_MAXSIZE}（满则丢最旧）| "
+        f"[主进程] {datetime.now():%Y-%m-%d %H:%M:%S} 启动闭环测评\n"
+        f"  架构: {SelectModel.upper()} | 权重: {UseModel} | 模型文件: {MODEL_PATH}\n"
+        f"  队列容量={QUEUE_MAXSIZE}（满则丢最旧）| "
         f"每包 {DOUBLES_PER_PACKET} doubles（1 标签 + {SIGNAL_DOUBLES_PER_PACKET} 信号）| "
         f"空闲≥{UDP_IDLE_TIMEOUT_SEC:.1f}s 无有效 UDP 则自动退出"
     )
