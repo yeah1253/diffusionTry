@@ -76,9 +76,15 @@ NORMALIZE_PER_WINDOW = True
 VOTE_WINDOW = 3
 DEVICE_STR = "cpu"
 
-# 测评结果写入 CSV（由推理进程追加）
+# 测评结果写入 CSV（由推理进程追加，每次推理一行）
 SAVE_METRICS = True
 METRICS_FILE = "evaluation_results.csv"
+
+# ── 每类诊断目标配置 ──────────────────────────────────────────────────────────
+# 每类故障目标推理次数：达到后打印该类汇总；切换故障类型时自动保存当前类结果并重置
+DIAGNOSES_PER_CLASS = 500
+# 各类故障汇总表路径（会话结束时追加写入，每类一行）
+CLASS_SUMMARY_FILE  = "class_summary.csv"
 
 # 接收空闲超时：连续若干秒未收到「有效」UDP 包（长度正确且解析成功并入队）则结束运行并输出汇总
 UDP_IDLE_TIMEOUT_SEC = 5.0
@@ -147,6 +153,22 @@ def print_session_summary(
         print("  最小/最大延迟:     无推理记录")
     if SAVE_METRICS:
         print(f"  指标已写入:        {metrics_path.resolve()}")
+
+    # —— 各故障类别明细（若推理进程已汇报 per_class 数据）——
+    per_class: dict | None = stats.get("per_class")
+    if per_class:
+        print("  —— 各故障类别诊断明细 ——")
+        header = f"  {'类别':>4}  {'推理数':>6}  {'单次准确率':>10}  {'确诊数':>6}  {'最终准确率':>10}  {'均延迟ms':>9}  状态"
+        print(header)
+        for lbl in sorted(per_class):
+            r    = per_class[lbl]
+            t    = r["total"]
+            nf   = r["n_final"]
+            a_s  = r["correct_single"] / t  if t  else 0.0
+            a_f  = r["correct_final"]  / nf if nf else 0.0
+            lat  = r["sum_lat_ms"] / t if t else 0.0
+            flag = "✓达标" if r["target_reached"] else f"  {t}/{DIAGNOSES_PER_CLASS}"
+            print(f"  {lbl:>4}  {t:>6}  {a_s:>10.4f}  {nf:>6}  {a_f:>10.4f}  {lat:>9.3f}  {flag}")
     print("=" * 60 + "\n")
 
 
@@ -430,6 +452,98 @@ def drain_queue_completely(q: Queue) -> int:
 
 
 # =============================================================================
+# 每类故障诊断统计辅助函数
+# =============================================================================
+
+
+def _init_class_record(label: int) -> dict:
+    """初始化单类故障的诊断统计记录。"""
+    return {
+        "label":          label,
+        "total":          0,              # 本类累计推理次数
+        "correct_single": 0,              # 单次预测正确数
+        "n_final":        0,              # 投票后最终确诊次数
+        "correct_final":  0,              # 最终确诊正确数
+        "sum_lat_ms":     0.0,            # 累计延迟 (ms)
+        "min_lat_ms":     None,           # 最小延迟
+        "max_lat_ms":     None,           # 最大延迟
+        "target_reached": False,          # 是否已完成 DIAGNOSES_PER_CLASS 次
+        "start_wall":     datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "end_wall":       None,
+    }
+
+
+def _print_class_summary(label: int, rec: dict) -> None:
+    """在控制台打印单类故障的完整诊断汇总。"""
+    t     = rec["total"]
+    cs    = rec["correct_single"]
+    nf    = rec["n_final"]
+    cf    = rec["correct_final"]
+    acc_s = cs / t  if t  else 0.0
+    acc_f = cf / nf if nf else 0.0
+    mean_lat = rec["sum_lat_ms"] / t if t else 0.0
+    tag   = "✓ 已达标" if rec["target_reached"] else "中途切换"
+    sep   = "─" * 62
+    print(f"\n{sep}", flush=True)
+    print(f"  [类别 {label} 诊断汇总]  {tag}  "
+          f"目标={DIAGNOSES_PER_CLASS}  完成={t}")
+    print(f"  单次推理准确率:   {cs}/{t} = {acc_s:.4f}")
+    if nf > 0:
+        print(f"  最终确诊准确率:   {cf}/{nf} = {acc_f:.4f}  （投票窗口={VOTE_WINDOW}）")
+    if t > 0:
+        print(f"  平均端到端延迟:   {mean_lat:.3f} ms  "
+              f"[min={rec['min_lat_ms']:.3f}  max={rec['max_lat_ms']:.3f}]")
+    print(f"  开始: {rec['start_wall']}  "
+          f"结束: {rec.get('end_wall') or '—'}")
+    print(f"{sep}\n", flush=True)
+
+
+def _save_class_summary(
+    per_class: dict,
+    summary_path: Path,
+    arch: str,
+    use_model: str,
+) -> None:
+    """将所有已记录故障类别的汇总统计追加写入 CSV（每次调用写入当前全量）。"""
+    if not per_class:
+        return
+    try:
+        new_file = not summary_path.is_file()
+        with open(summary_path, "a", newline="", encoding="utf-8-sig") as f:
+            w = csv.writer(f)
+            if new_file:
+                w.writerow([
+                    "arch", "use_model", "class_id", "target",
+                    "total_inferences", "correct_single", "single_accuracy",
+                    "n_final", "correct_final", "final_accuracy",
+                    "mean_lat_ms", "min_lat_ms", "max_lat_ms",
+                    "target_reached", "start_wall", "end_wall",
+                ])
+            for lbl in sorted(per_class):
+                r   = per_class[lbl]
+                t   = r["total"]
+                nf  = r["n_final"]
+                w.writerow([
+                    arch, use_model, lbl, DIAGNOSES_PER_CLASS,
+                    t,
+                    r["correct_single"],
+                    f"{r['correct_single']/t:.4f}"  if t  else "0.0000",
+                    nf,
+                    r["correct_final"],
+                    f"{r['correct_final']/nf:.4f}"  if nf else "0.0000",
+                    f"{r['sum_lat_ms']/t:.4f}"       if t  else "0.0000",
+                    f"{r['min_lat_ms']:.4f}"  if r["min_lat_ms"]  is not None else "",
+                    f"{r['max_lat_ms']:.4f}"  if r["max_lat_ms"]  is not None else "",
+                    r["target_reached"],
+                    r["start_wall"],
+                    r.get("end_wall") or "",
+                ])
+        print(f"[汇总] 各类结果已保存 → {summary_path.resolve()}", flush=True)
+    except OSError as exc:
+        print(f"[警告] 保存各类汇总失败: {exc}", file=sys.stderr)
+
+
+# =============================================================================
 # 进程 A：UDP 接收（仅收包 + T_recv 打点 + 入队）
 # =============================================================================
 
@@ -571,10 +685,14 @@ def _inference_worker_with_stats(
     num_classes: int,
     model_path: str,
     device_str: str,
+    class_summary_path: Path | None = None,
 ) -> None:
     """
     从队列取 (T_recv, label, 128 点振动)；deque 缓冲样本流；
     每满 1024 点推理一次，T_done 与触发该次推理的数据包 T_recv 之差为端到端延迟。
+
+    每类故障最多追踪 DIAGNOSES_PER_CLASS 次推理；
+    切换故障类型时自动打印上一类汇总；会话结束时保存所有类别统计到 class_summary_path。
     退出时经 stats_queue 向主进程发送汇总（供 Ctrl+C 后打印报告）。
     """
 
@@ -624,6 +742,9 @@ def _inference_worker_with_stats(
     sum_latency_ms = 0.0
     min_lat_ms: float | None = None
     max_lat_ms: float | None = None
+
+    # 每类故障独立统计：{class_id → record dict}
+    per_class: dict[int, dict] = {}
 
     csv_file = None
     csv_writer = None
@@ -676,14 +797,34 @@ def _inference_worker_with_stats(
                 # GT 变化时清空滑窗与投票：否则 1024 点会跨故障拼接，与训练「单类连续采样」不一致
                 gt_clamped = max(0, min(num_classes - 1, int(gt_label)))
                 if last_gt_consumer is not None and gt_clamped != last_gt_consumer:
+                    # ── 收尾上一类别：打印汇总（若尚未在达标时打印过）──
+                    prev = per_class.get(last_gt_consumer)
+                    if prev is not None:
+                        if prev["end_wall"] is None:
+                            prev["end_wall"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        if not prev["target_reached"]:
+                            # 未达标（中途切换），仍打印当前进度
+                            _print_class_summary(last_gt_consumer, prev)
+                        # 立即将本类结果写入汇总 CSV
+                        if class_summary_path is not None:
+                            _save_class_summary(per_class, class_summary_path,
+                                                SelectModel, UseModel)
+                    # ── 清空缓冲 ──
                     sample_buf.clear()
                     vote_q.clear()
                     last_final = None
                     print(
-                        f"[推理进程] GT {last_gt_consumer} -> {gt_clamped}，已清空样本滑窗与投票状态。",
+                        f"[推理进程] GT {last_gt_consumer} → {gt_clamped}，"
+                        f"已清空样本滑窗与投票，开始记录类别 {gt_clamped}。",
                         flush=True,
                     )
                 last_gt_consumer = gt_clamped
+
+                # ── 首次出现该类别时初始化统计记录 ──
+                if gt_clamped not in per_class:
+                    per_class[gt_clamped] = _init_class_record(gt_clamped)
+                    print(f"[推理进程] 开始记录类别 {gt_clamped} | 目标={DIAGNOSES_PER_CLASS} 次推理。",
+                          flush=True)
 
                 if gt_label != gt_clamped:
                     print(
@@ -711,15 +852,29 @@ def _inference_worker_with_stats(
                     if pred == gt_clamped:
                         correct_single += 1
 
+                    # ── 更新当前类别统计 ──
+                    cls_rec = per_class[gt_clamped]
+                    cls_rec["total"] += 1
+                    if pred == gt_clamped:
+                        cls_rec["correct_single"] += 1
+                    cls_rec["sum_lat_ms"] += e2e_ms
+                    cls_rec["min_lat_ms"] = (e2e_ms if cls_rec["min_lat_ms"] is None
+                                             else min(cls_rec["min_lat_ms"], e2e_ms))
+                    cls_rec["max_lat_ms"] = (e2e_ms if cls_rec["max_lat_ms"] is None
+                                             else max(cls_rec["max_lat_ms"], e2e_ms))
+
                     vote_q.append(pred)
                     now_wall = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    # 本类已完成次数 / 目标（进度指示）
+                    cls_progress = f"{cls_rec['total']}/{DIAGNOSES_PER_CLASS}"
 
                     final_str = ""
                     final_id: int | None = None
                     if len(vote_q) < VOTE_WINDOW:
                         print(
                             f"[{now_wall}] GT={gt_clamped} | 单次={pred} | 投票未满 ({len(vote_q)}/{VOTE_WINDOW}) | "
-                            f"最终=— | E2E={e2e_ms:.3f} ms | 单次准确率={correct_single}/{total_inferences}"
+                            f"最终=— | E2E={e2e_ms:.3f} ms | 单次准确率={correct_single}/{total_inferences} | "
+                            f"类别进度={cls_progress}"
                         )
                     else:
                         final_id, tied = majority_vote(list(vote_q), last_final)
@@ -731,17 +886,30 @@ def _inference_worker_with_stats(
                         last_final = final_id
                         final_str = str(final_id)
                         n_final += 1
+                        cls_rec["n_final"] += 1
                         if final_id == gt_clamped:
                             correct_final += 1
+                            cls_rec["correct_final"] += 1
 
-                        acc_s = correct_single / total_inferences
-                        acc_f = correct_final / n_final if n_final else 0.0
+                        acc_s    = correct_single / total_inferences
+                        acc_f    = correct_final / n_final if n_final else 0.0
                         mean_lat = sum_latency_ms / total_inferences
                         print(
                             f"[{now_wall}] GT={gt_clamped} | 单次={pred} | 窗口={list(vote_q)} | "
                             f"【最终确诊】={final_id} | E2E={e2e_ms:.3f} ms | "
-                            f"单次准确率={acc_s:.4f} | 最终准确率={acc_f:.4f} | 平均E2E={mean_lat:.3f} ms"
+                            f"单次准确率={acc_s:.4f} | 最终准确率={acc_f:.4f} | "
+                            f"平均E2E={mean_lat:.3f} ms | 类别进度={cls_progress}"
                         )
+
+                    # ── 当前类别达到目标次数时打印类别汇总 ──
+                    if (not cls_rec["target_reached"]
+                            and cls_rec["total"] >= DIAGNOSES_PER_CLASS):
+                        cls_rec["target_reached"] = True
+                        cls_rec["end_wall"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        _print_class_summary(gt_clamped, cls_rec)
+                        if class_summary_path is not None:
+                            _save_class_summary(per_class, class_summary_path,
+                                                SelectModel, UseModel)
 
                     if csv_writer is not None:
                         try:
@@ -769,27 +937,46 @@ def _inference_worker_with_stats(
                 csv_file.close()
             except OSError:
                 pass
+
+        # ── 收尾最后一个故障类别（若尚未打印过汇总）──
+        if last_gt_consumer is not None and last_gt_consumer in per_class:
+            last_rec = per_class[last_gt_consumer]
+            if last_rec["end_wall"] is None:
+                last_rec["end_wall"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            if not last_rec["target_reached"]:
+                _print_class_summary(last_gt_consumer, last_rec)
+
+        # ── 会话结束：保存所有类别汇总 CSV ──
+        if per_class and class_summary_path is not None:
+            _save_class_summary(per_class, class_summary_path, SelectModel, UseModel)
+
         print("[推理进程] 已退出。", flush=True)
 
     mean_all = sum_latency_ms / total_inferences if total_inferences else 0.0
     stats_queue.put(
         {
-            "ok": True,
+            "ok":               True,
             "total_inferences": total_inferences,
-            "correct_single": correct_single,
-            "n_final": n_final,
-            "correct_final": correct_final,
-            "mean_latency_ms": mean_all,
-            "min_latency_ms": min_lat_ms,
-            "max_latency_ms": max_lat_ms,
+            "correct_single":   correct_single,
+            "n_final":          n_final,
+            "correct_final":    correct_final,
+            "mean_latency_ms":  mean_all,
+            "min_latency_ms":   min_lat_ms,
+            "max_latency_ms":   max_lat_ms,
+            "per_class":        per_class,          # 各类别详细统计
         }
     )
 
 
 def main() -> int:
     script_dir = Path(__file__).resolve().parent
-    pkt_size = DOUBLES_PER_PACKET * 8
-    metrics_path = script_dir / METRICS_FILE if not Path(METRICS_FILE).is_absolute() else Path(METRICS_FILE)
+    pkt_size   = DOUBLES_PER_PACKET * 8
+    metrics_path      = (script_dir / METRICS_FILE
+                         if not Path(METRICS_FILE).is_absolute()
+                         else Path(METRICS_FILE))
+    class_summary_path = (script_dir / CLASS_SUMMARY_FILE
+                          if not Path(CLASS_SUMMARY_FILE).is_absolute()
+                          else Path(CLASS_SUMMARY_FILE))
 
     pkt_queue: Queue = Queue(maxsize=QUEUE_MAXSIZE)
     stop_event = Event()
@@ -812,6 +999,7 @@ def main() -> int:
             NUM_CLASSES,
             MODEL_PATH,
             DEVICE_STR,
+            class_summary_path,   # 新增：各类汇总文件路径
         ),
         name="InferenceWorker",
         daemon=False,
@@ -820,6 +1008,7 @@ def main() -> int:
     print(
         f"[主进程] {datetime.now():%Y-%m-%d %H:%M:%S} 启动闭环测评\n"
         f"  架构: {SelectModel.upper()} | 权重: {UseModel} | 模型文件: {MODEL_PATH}\n"
+        f"  每类目标={DIAGNOSES_PER_CLASS} 次推理 | 汇总文件: {class_summary_path.name}\n"
         f"  队列容量={QUEUE_MAXSIZE}（满则丢最旧）| "
         f"每包 {DOUBLES_PER_PACKET} doubles（1 标签 + {SIGNAL_DOUBLES_PER_PACKET} 信号）| "
         f"空闲≥{UDP_IDLE_TIMEOUT_SEC:.1f}s 无有效 UDP 则自动退出"
