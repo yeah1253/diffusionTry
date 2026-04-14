@@ -21,8 +21,9 @@ Simulink 侧需与 Byte Unpack [129] double 对齐。
 空闲退出：UDP_IDLE_TIMEOUT_SEC 秒内未收到「长度正确且解析成功并入队」的包时，接收进程停止并触发汇总，
 主进程打印平均诊断时间（端到端 ms）与平均诊断准确率后退出。
 
-可选：SAVE_UDP_WINDOWS_FOR_TSNE 为真时，会话结束写入 UDP_WINDOWS_NPZ（X,y,pred），
-可用 plot_udp_windows_tsne.py 画 t-SNE。
+可选：SAVE_UDP_WINDOWS_FOR_TSNE 为真时，会话结束写入 UDP_WINDOWS_NPZ：
+  X 为每次推理时分类器最后一层 Linear **之前** 的特征向量 (N, D)，y 为 GT，pred 为单次预测；
+  不再保存 1024 点原始窗。可用 plot_udp_windows_tsne.py 对 X 做 t-SNE（按 y 着色）。
 """
 
 from __future__ import annotations
@@ -92,10 +93,9 @@ CLASS_SUMMARY_FILE  = "class_summary.csv"
 # 接收空闲超时：连续若干秒未收到「有效」UDP 包（长度正确且解析成功并入队）则结束运行并输出汇总
 UDP_IDLE_TIMEOUT_SEC = 5.0
 
-# 会话结束时保存每次推理的 1024 点窗（与推理输入一致：已按 NORMALIZE_PER_WINDOW 处理）+ GT + 单次 pred
-# 供 plot_udp_windows_tsne.py 做 t-SNE 可视化
+# 会话结束时保存分类器输入特征（最后一层 Linear 之前，N×D）+ GT + 单次 pred，供 t-SNE
 SAVE_UDP_WINDOWS_FOR_TSNE = True
-UDP_WINDOWS_NPZ = "hil_udp_inference_windows.npz"
+UDP_WINDOWS_NPZ = "hil_udp_classifier_head.npz"
 MAX_SAVED_WINDOWS = 200000
 
 # 与 train_bearing_cnn1d 一级子目录字典序、HIL_send/pack_hil_for_coder 默认 fault_list 一致（用于启动时校验）
@@ -420,10 +420,10 @@ def load_diagnostic_model(model_path: str, num_classes: int):
     return m
 
 
-def run_single_inference(model, chunk: list[float], device_str: str) -> int:
+def _window_to_tensor(chunk: list[float], device_str: str):
+    """单窗 → (1, 1, L) 张量，与在线推理归一化一致。"""
     import numpy as np
     import torch
-    import torch.nn as nn
 
     if len(chunk) != POINTS_PER_INFERENCE:
         raise ValueError(f"chunk 长度应为 {POINTS_PER_INFERENCE}，实际 {len(chunk)}")
@@ -433,21 +433,90 @@ def run_single_inference(model, chunk: list[float], device_str: str) -> int:
         arr = (arr - float(arr.mean())) / (float(arr.std()) + 1e-6)
 
     x = torch.from_numpy(arr).to(device=device_str)
-    x = x.unsqueeze(0).unsqueeze(0)   # (1, 1, L)
+    return x.unsqueeze(0).unsqueeze(0)
+
+
+def infer_window(
+    model,
+    chunk: list[float],
+    device_str: str,
+    *,
+    with_head_features: bool,
+) -> tuple[int, object | None]:
+    """
+    单次滑窗推理。with_head_features 为真时额外返回 (D,) float32 分类器输入特征（CPU numpy），
+    否则第二项为 None。与 ``run_single_inference`` 共用同一套归一化与张量构造。
+    """
+    import numpy as np
+    import torch
+    import torch.nn as nn
+
+    x = _window_to_tensor(chunk, device_str)
+
+    if not with_head_features:
+        if isinstance(model, nn.Module):
+            with torch.no_grad():
+                out = model(x)
+        else:
+            out = model(x)
+        if isinstance(out, torch.Tensor):
+            if out.dim() == 0:
+                return int(out.item()), None
+            return int(out.argmax(dim=-1).item()), None
+        return int(out), None
+
+    try:
+        from model import BearingRFWrapper, extract_classifier_input_features
+    except ImportError as e:
+        print(f"[推理进程] 无法导入 model.extract_classifier_input_features: {e}", file=sys.stderr)
+        return run_single_inference(model, chunk, device_str), None
+
+    if isinstance(model, BearingRFWrapper):
+        with torch.no_grad():
+            h = extract_classifier_input_features(model, x)
+        proba = model.rf.predict_proba(h.detach().cpu().numpy())
+        pred = int(np.argmax(proba[0]))
+        feat = h.squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)
+        return pred, feat
 
     if isinstance(model, nn.Module):
-        # PyTorch 神经网络（CNN / LSTM / Transformer）
         with torch.no_grad():
-            out = model(x)
-    else:
-        # 非 nn.Module 可调用对象（如 BearingRFWrapper），不需要 no_grad 上下文
-        out = model(x)
+            try:
+                h = extract_classifier_input_features(model, x)
+            except (TypeError, RuntimeError) as e:
+                print(
+                    f"[推理进程] 提取分类器特征失败（{e}），本窗仅推理不写特征。",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                out = model(x)
+                pred = int(out.argmax(dim=-1).item()) if out.dim() > 0 else int(out.item())
+                return pred, None
+            clf = getattr(model, "classifier", None)
+            if isinstance(clf, nn.Linear):
+                out = clf(h)
+            elif hasattr(model, "fc") and isinstance(getattr(model, "fc"), nn.Linear):
+                out = model.fc(h)
+            else:
+                out = model(x)
+        if isinstance(out, torch.Tensor):
+            pred = int(out.argmax(dim=-1).item()) if out.dim() > 0 else int(out.item())
+        else:
+            pred = int(out)
+        feat = h.squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)
+        return pred, feat
 
+    out = model(x)
     if isinstance(out, torch.Tensor):
-        if out.dim() == 0:
-            return int(out.item())
-        return int(out.argmax(dim=-1).item())
-    return int(out)
+        pred = int(out.argmax(dim=-1).item()) if out.dim() > 0 else int(out.item())
+    else:
+        pred = int(out)
+    return pred, None
+
+
+def run_single_inference(model, chunk: list[float], device_str: str) -> int:
+    pred, _ = infer_window(model, chunk, device_str, with_head_features=False)
+    return pred
 
 
 def majority_vote(recent_preds: list[int], tie_fallback: int | None) -> tuple[int, bool]:
@@ -763,10 +832,10 @@ def _inference_worker_with_stats(
     每类故障最多追踪 DIAGNOSES_PER_CLASS 次推理；
     切换故障类型时自动打印上一类汇总；会话结束时保存所有类别统计到 class_summary_path。
     退出时经 stats_queue 向主进程发送汇总（供 Ctrl+C 后打印报告）。
-    windows_npz_path 非空时，在会话结束写入 hil_udp_inference_windows.npz（见全局 SAVE_UDP_WINDOWS_FOR_TSNE）。
+    windows_npz_path 非空时，在会话结束写入分类器头特征 npz（见全局 SAVE_UDP_WINDOWS_FOR_TSNE）。
     """
 
-    saved_rows: list = []
+    saved_feats: list = []
     saved_gt: list[int] = []
     saved_pred: list[int] = []
 
@@ -915,14 +984,19 @@ def _inference_worker_with_stats(
                 while len(sample_buf) >= POINTS_PER_INFERENCE:
                     chunk = [sample_buf.popleft() for _ in range(POINTS_PER_INFERENCE)]
 
-                    pred = run_single_inference(model, chunk, device_str)
+                    need_head = (
+                        windows_npz_path is not None and len(saved_feats) < MAX_SAVED_WINDOWS
+                    )
+                    pred, head_feat = infer_window(
+                        model, chunk, device_str, with_head_features=need_head
+                    )
                     if pred < 0 or pred >= num_classes:
                         pred = max(0, min(num_classes - 1, pred))
 
-                    if windows_npz_path is not None and len(saved_rows) < MAX_SAVED_WINDOWS:
+                    if windows_npz_path is not None and head_feat is not None:
                         import numpy as _np
 
-                        saved_rows.append(_np.asarray(chunk, dtype=_np.float32))
+                        saved_feats.append(_np.asarray(head_feat, dtype=_np.float32, copy=False))
                         saved_gt.append(int(gt_clamped))
                         saved_pred.append(int(pred))
 
@@ -1040,11 +1114,11 @@ def _inference_worker_with_stats(
         except Exception:
             pass
 
-        if windows_npz_path is not None and len(saved_rows) > 0:
+        if windows_npz_path is not None and len(saved_feats) > 0:
             try:
                 import numpy as _np
 
-                X_stacked = _np.stack(saved_rows, axis=0)
+                X_stacked = _np.stack(saved_feats, axis=0)
                 y_arr = _np.array(saved_gt, dtype=_np.int64)
                 p_arr = _np.array(saved_pred, dtype=_np.int64)
                 _np.savez_compressed(
@@ -1053,11 +1127,14 @@ def _inference_worker_with_stats(
                     y=y_arr,
                     pred=p_arr,
                     num_classes=_np.int32(num_classes),
+                    feat_dim=_np.int32(X_stacked.shape[1]),
+                    feature_kind=_np.array("classifier_input"),
                     window_len=_np.int32(POINTS_PER_INFERENCE),
                     normalized=_np.bool_(NORMALIZE_PER_WINDOW),
                 )
                 print(
-                    f"[推理进程] 已保存 {len(saved_rows)} 条推理窗 → {windows_npz_path.resolve()}",
+                    f"[推理进程] 已保存 {len(saved_feats)} 条分类器头特征 (D={X_stacked.shape[1]}) → "
+                    f"{windows_npz_path.resolve()}",
                     flush=True,
                 )
             except Exception as e:
@@ -1122,9 +1199,9 @@ def main() -> int:
     )
 
     _win_msg = (
-        f"  推理窗保存: {windows_npz_path.name}（最多 {MAX_SAVED_WINDOWS} 条）\n"
+        f"  分类器头特征保存: {windows_npz_path.name}（最多 {MAX_SAVED_WINDOWS} 条）\n"
         if windows_npz_path is not None
-        else "  推理窗保存: 关\n"
+        else "  分类器头特征保存: 关\n"
     )
     print(
         f"[主进程] {datetime.now():%Y-%m-%d %H:%M:%S} 启动闭环测评\n"

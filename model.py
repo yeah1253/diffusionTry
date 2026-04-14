@@ -13,6 +13,7 @@
   BearingRFWrapper   — 随机森林（sklearn），兼容 PyTorch 推理接口
 
 所有 PyTorch 模型统一接受 (B, 1, L=1024)，输出 (B, num_classes) logits。
+离线 / 在线 t-SNE 对比时，分类器 Linear 前的向量由 ``extract_classifier_input_features`` 统一提取。
 
 架构切换：修改顶部的 ``SelectModel`` 变量，无需改动训练脚本。
 
@@ -32,7 +33,7 @@ import torch.nn as nn
 # 修改此处切换架构；train_bearing_cnn1d.py 会自动读取。
 # =============================================================================
 
-SelectModel: str = "mobilenet"
+SelectModel: str = "cnn"
 """全局架构选择，可选值：
   "cnn"         — BearingCNN1D（标准 1D-CNN，推荐基线）
   "transformer" — BearingTransformer（Patch-ViT Encoder）
@@ -732,6 +733,89 @@ class BearingRFWrapper:
 
     def load_state_dict(self, *a, **kw):
         raise NotImplementedError("RF 不支持 load_state_dict。")
+
+
+def extract_classifier_input_features(
+    model: nn.Module | BearingRFWrapper,
+    x: torch.Tensor,
+) -> torch.Tensor:
+    """
+    最后一层分类 Linear **之前** 的表示 (B, D)，用于 t-SNE / 特征分析。
+
+    与各模型 ``forward`` 中传入 ``self.classifier``（或等价路径）的向量一致；
+    ``BearingRFWrapper`` 对应 ``extract_rf_features`` 拼成的手工特征 (B, 26)。
+
+    Parameters
+    ----------
+    model : nn.Module | BearingRFWrapper
+    x : (B, 1, L)，通常 L=1024
+
+    Returns
+    -------
+    (B, D) tensor；RF 为 float32，其余与 ``x`` 的 device/dtype 一致。
+    """
+    if isinstance(model, BearingRFWrapper):
+        x_np = x.squeeze(1).detach().cpu().numpy()
+        arr = np.stack([extract_rf_features(xi) for xi in x_np]).astype(np.float32)
+        return torch.from_numpy(arr).to(device=x.device, dtype=torch.float32)
+
+    if isinstance(model, BearingCNN1D):
+        return model.features(x).squeeze(-1)
+
+    if isinstance(model, BearingTransformer):
+        B, _, L = x.shape
+        ps = model.patch_size
+        t = x.squeeze(1).reshape(B, L // ps, ps)
+        t = model.patch_embed(t) + model.pos_embed
+        return model.norm(model.encoder(t).mean(dim=1))
+
+    if isinstance(model, BearingTCN):
+        return model.pool(model.network(x)).squeeze(-1)
+
+    if isinstance(model, BearingMobileNet1D):
+        t = model.stem(x)
+        t = model.blocks(t)
+        return model.drop(model.pool(t).squeeze(-1))
+
+    if isinstance(model, BearingResNet1D):
+        t = model.stem(x)
+        t = model.blocks(t)
+        return model.pool(t).squeeze(-1)
+
+    if isinstance(model, BearingShuffleNet1D):
+        t = model.stem(x)
+        t = model.stage1(t)
+        t = model.stage2(t)
+        t = model.stage3(t)
+        return model.pool(t).squeeze(-1)
+
+    if isinstance(model, BearingConformer):
+        t = model.cnn_stem(x)
+        t = t.permute(0, 2, 1)
+        t = t + model.pos_embed
+        t = model.encoder(t)
+        return model.norm(t.mean(dim=1))
+
+    # receive_udp_hil 占位模型：仅 nn.Linear(1024, C)，无主干
+    fc = getattr(model, "fc", None)
+    if isinstance(fc, nn.Linear) and not hasattr(model, "features"):
+        if x.dim() == 3:
+            return x.squeeze(1)
+        return x
+
+    # 旧版 / 自定义：若有标准 ``features`` + ``classifier``(Linear)
+    feats = getattr(model, "features", None)
+    clf = getattr(model, "classifier", None)
+    if feats is not None and isinstance(clf, nn.Linear):
+        t = feats(x)
+        if t.dim() == 3:
+            t = t.squeeze(-1)
+        return t
+
+    raise TypeError(
+        f"无法提取分类器输入特征，未知模型类型: {type(model).__name__}。"
+        "请为该机型在 model.extract_classifier_input_features 中补充分支。"
+    )
 
 
 # =============================================================================
