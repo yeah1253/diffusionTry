@@ -20,6 +20,9 @@ Simulink 侧需与 Byte Unpack [129] double 对齐。
 
 空闲退出：UDP_IDLE_TIMEOUT_SEC 秒内未收到「长度正确且解析成功并入队」的包时，接收进程停止并触发汇总，
 主进程打印平均诊断时间（端到端 ms）与平均诊断准确率后退出。
+
+可选：SAVE_UDP_WINDOWS_FOR_TSNE 为真时，会话结束写入 UDP_WINDOWS_NPZ（X,y,pred），
+可用 plot_udp_windows_tsne.py 画 t-SNE。
 """
 
 from __future__ import annotations
@@ -89,6 +92,55 @@ CLASS_SUMMARY_FILE  = "class_summary.csv"
 # 接收空闲超时：连续若干秒未收到「有效」UDP 包（长度正确且解析成功并入队）则结束运行并输出汇总
 UDP_IDLE_TIMEOUT_SEC = 5.0
 
+# 会话结束时保存每次推理的 1024 点窗（与推理输入一致：已按 NORMALIZE_PER_WINDOW 处理）+ GT + 单次 pred
+# 供 plot_udp_windows_tsne.py 做 t-SNE 可视化
+SAVE_UDP_WINDOWS_FOR_TSNE = True
+UDP_WINDOWS_NPZ = "hil_udp_inference_windows.npz"
+MAX_SAVED_WINDOWS = 200000
+
+# 与 train_bearing_cnn1d 一级子目录字典序、HIL_send/pack_hil_for_coder 默认 fault_list 一致（用于启动时校验）
+EXPECTED_CLASS_ORDER_FOR_HIL = (
+    "IF0.2",
+    "IF0.4",
+    "IF0.6",
+    "NC",
+    "OF0.2",
+    "OF0.4",
+    "OF0.6",
+    "RF0.2",
+    "RF0.4",
+    "RF0.6",
+)
+
+
+def _verify_hil_class_order(names: list | tuple | None) -> None:
+    """标准十类工程：检测 class_names 是否与字典序一致；集合相同但顺序不同时高危（标签与物理类错位）。"""
+    if not names:
+        return
+    if len(names) != len(EXPECTED_CLASS_ORDER_FOR_HIL):
+        return
+    got = tuple(str(x) for x in names)
+    if got == EXPECTED_CLASS_ORDER_FOR_HIL:
+        return
+    exp_s = set(EXPECTED_CLASS_ORDER_FOR_HIL)
+    got_s = set(got)
+    if exp_s == got_s:
+        print(
+            "[警告] class_names 与标准十类**名称集合相同但顺序不同**（训练标签语义已变）:\n"
+            f"  标准序: {list(EXPECTED_CLASS_ORDER_FOR_HIL)}\n"
+            f"  当前序: {list(got)}\n"
+            "  HIL 的 fault_list 必须与**当前 checkpoint 顺序**一致，不能用默认 fault_list 硬套。",
+            file=sys.stderr,
+            flush=True,
+        )
+    else:
+        print(
+            "[信息] class_names 非标准十类命名，已跳过顺序自动校验；"
+            "请用 check_hil_class_alignment.py 对照 DATA_ROOT 与 pack fault_list。",
+            flush=True,
+        )
+
+
 # =============================================================================
 # 工具函数
 # =============================================================================
@@ -102,6 +154,34 @@ def fetch_stats_from_queue(stats_queue: Queue, retries: int = 40, sleep_s: float
         except queue.Empty:
             time.sleep(sleep_s)
     return None
+
+
+def print_per_class_diagnosis_table(stats: dict) -> None:
+    """
+    打印「各故障类别诊断明细」表（与测评汇总中格式一致）。
+    stats 须含 ok 与 per_class（值为 _init_class_record 结构）。
+    """
+    per_class = stats.get("per_class")
+    if not per_class:
+        return
+    print("  —— 各故障类别诊断明细 ——", flush=True)
+    header = (
+        f"  {'类别':>4}  {'推理数':>6}  {'单次准确率':>10}  {'确诊数':>6}  "
+        f"{'最终准确率':>10}  {'均延迟ms':>9}  状态"
+    )
+    print(header, flush=True)
+    for lbl in sorted(per_class, key=lambda x: int(x) if isinstance(x, int) else x):
+        r = per_class[lbl]
+        t = int(r["total"])
+        nf = int(r["n_final"])
+        a_s = r["correct_single"] / t if t else 0.0
+        a_f = r["correct_final"] / nf if nf else 0.0
+        lat = r["sum_lat_ms"] / t if t else 0.0
+        status = f"{t}/{DIAGNOSES_PER_CLASS}"
+        print(
+            f"  {int(lbl):>4}  {t:>6}  {a_s:>10.4f}  {nf:>6}  {a_f:>10.4f}  {lat:>9.3f}  {status}",
+            flush=True,
+        )
 
 
 def print_session_summary(
@@ -154,22 +234,8 @@ def print_session_summary(
     if SAVE_METRICS:
         print(f"  指标已写入:        {metrics_path.resolve()}")
 
-    # —— 各故障类别明细（若推理进程已汇报 per_class 数据）——
-    per_class: dict | None = stats.get("per_class")
-    if per_class:
-        print("  —— 各故障类别诊断明细 ——")
-        header = f"  {'类别':>4}  {'推理数':>6}  {'单次准确率':>10}  {'确诊数':>6}  {'最终准确率':>10}  {'均延迟ms':>9}  状态"
-        print(header)
-        for lbl in sorted(per_class):
-            r    = per_class[lbl]
-            t    = r["total"]
-            nf   = r["n_final"]
-            a_s  = r["correct_single"] / t  if t  else 0.0
-            a_f  = r["correct_final"]  / nf if nf else 0.0
-            lat  = r["sum_lat_ms"] / t if t else 0.0
-            flag = "✓达标" if r["target_reached"] else f"  {t}/{DIAGNOSES_PER_CLASS}"
-            print(f"  {lbl:>4}  {t:>6}  {a_s:>10.4f}  {nf:>6}  {a_f:>10.4f}  {lat:>9.3f}  {flag}")
-    print("=" * 60 + "\n")
+    print_per_class_diagnosis_table(stats)
+    print("=" * 60 + "\n", flush=True)
 
 
 def unpack_labeled_packet(
@@ -305,6 +371,7 @@ def load_diagnostic_model(model_path: str, num_classes: int):
             print(f"[信息] 已加载 RandomForest checkpoint: {path} | num_classes={nc}")
             if names:
                 print(f"[信息] 类别顺序: {names}")
+                _verify_hil_class_order(names)
             return wrapper
 
         # ── PyTorch 神经网络（CNN / Transformer / TCN / MobileNet / ResNet / ShuffleNet / Conformer）──
@@ -334,6 +401,7 @@ def load_diagnostic_model(model_path: str, num_classes: int):
                 print(f"[信息] 已加载 {arch} checkpoint: {path} | num_classes={nc}")
                 if names:
                     print(f"[信息] 类别顺序: {names}")
+                    _verify_hil_class_order(names)
                 return m
             except Exception as e:
                 print(f"[警告] 加载 state_dict 失败: {e}，改用占位模型。", file=sys.stderr)
@@ -686,6 +754,7 @@ def _inference_worker_with_stats(
     model_path: str,
     device_str: str,
     class_summary_path: Path | None = None,
+    windows_npz_path: Path | None = None,
 ) -> None:
     """
     从队列取 (T_recv, label, 128 点振动)；deque 缓冲样本流；
@@ -694,7 +763,12 @@ def _inference_worker_with_stats(
     每类故障最多追踪 DIAGNOSES_PER_CLASS 次推理；
     切换故障类型时自动打印上一类汇总；会话结束时保存所有类别统计到 class_summary_path。
     退出时经 stats_queue 向主进程发送汇总（供 Ctrl+C 后打印报告）。
+    windows_npz_path 非空时，在会话结束写入 hil_udp_inference_windows.npz（见全局 SAVE_UDP_WINDOWS_FOR_TSNE）。
     """
+
+    saved_rows: list = []
+    saved_gt: list[int] = []
+    saved_pred: list[int] = []
 
     try:
         model = load_diagnostic_model(model_path, num_classes)
@@ -789,6 +863,8 @@ def _inference_worker_with_stats(
             try:
                 t_recv, gt_label, signal = pkt_queue.get(timeout=0.25)
             except queue.Empty:
+                if stop_event.is_set():
+                    break
                 continue
             except (EOFError, OSError):
                 break
@@ -842,6 +918,13 @@ def _inference_worker_with_stats(
                     pred = run_single_inference(model, chunk, device_str)
                     if pred < 0 or pred >= num_classes:
                         pred = max(0, min(num_classes - 1, pred))
+
+                    if windows_npz_path is not None and len(saved_rows) < MAX_SAVED_WINDOWS:
+                        import numpy as _np
+
+                        saved_rows.append(_np.asarray(chunk, dtype=_np.float32))
+                        saved_gt.append(int(gt_clamped))
+                        saved_pred.append(int(pred))
 
                     # 端到端终点：本窗 forward 结束时刻（与上方该次 recv 对应的 t_recv 同用 perf_counter 时钟域）
                     t_done = time.perf_counter()
@@ -938,6 +1021,48 @@ def _inference_worker_with_stats(
             except OSError:
                 pass
 
+        # 优先上报汇总（含 per_class），避免后续打印/写盘耗时导致主进程 terminate 时子进程来不及 put
+        mean_all = sum_latency_ms / total_inferences if total_inferences else 0.0
+        try:
+            stats_queue.put_nowait(
+                {
+                    "ok": True,
+                    "total_inferences": total_inferences,
+                    "correct_single": correct_single,
+                    "n_final": n_final,
+                    "correct_final": correct_final,
+                    "mean_latency_ms": mean_all,
+                    "min_latency_ms": min_lat_ms,
+                    "max_latency_ms": max_lat_ms,
+                    "per_class": dict(per_class),
+                }
+            )
+        except Exception:
+            pass
+
+        if windows_npz_path is not None and len(saved_rows) > 0:
+            try:
+                import numpy as _np
+
+                X_stacked = _np.stack(saved_rows, axis=0)
+                y_arr = _np.array(saved_gt, dtype=_np.int64)
+                p_arr = _np.array(saved_pred, dtype=_np.int64)
+                _np.savez_compressed(
+                    str(windows_npz_path),
+                    X=X_stacked,
+                    y=y_arr,
+                    pred=p_arr,
+                    num_classes=_np.int32(num_classes),
+                    window_len=_np.int32(POINTS_PER_INFERENCE),
+                    normalized=_np.bool_(NORMALIZE_PER_WINDOW),
+                )
+                print(
+                    f"[推理进程] 已保存 {len(saved_rows)} 条推理窗 → {windows_npz_path.resolve()}",
+                    flush=True,
+                )
+            except Exception as e:
+                print(f"[推理进程] 保存推理窗 npz 失败: {e}", file=sys.stderr, flush=True)
+
         # ── 收尾最后一个故障类别（若尚未打印过汇总）──
         if last_gt_consumer is not None and last_gt_consumer in per_class:
             last_rec = per_class[last_gt_consumer]
@@ -952,21 +1077,6 @@ def _inference_worker_with_stats(
 
         print("[推理进程] 已退出。", flush=True)
 
-    mean_all = sum_latency_ms / total_inferences if total_inferences else 0.0
-    stats_queue.put(
-        {
-            "ok":               True,
-            "total_inferences": total_inferences,
-            "correct_single":   correct_single,
-            "n_final":          n_final,
-            "correct_final":    correct_final,
-            "mean_latency_ms":  mean_all,
-            "min_latency_ms":   min_lat_ms,
-            "max_latency_ms":   max_lat_ms,
-            "per_class":        per_class,          # 各类别详细统计
-        }
-    )
-
 
 def main() -> int:
     script_dir = Path(__file__).resolve().parent
@@ -977,6 +1087,11 @@ def main() -> int:
     class_summary_path = (script_dir / CLASS_SUMMARY_FILE
                           if not Path(CLASS_SUMMARY_FILE).is_absolute()
                           else Path(CLASS_SUMMARY_FILE))
+    windows_npz_path = (
+        (script_dir / UDP_WINDOWS_NPZ)
+        if SAVE_UDP_WINDOWS_FOR_TSNE and not Path(UDP_WINDOWS_NPZ).is_absolute()
+        else (Path(UDP_WINDOWS_NPZ) if SAVE_UDP_WINDOWS_FOR_TSNE else None)
+    )
 
     pkt_queue: Queue = Queue(maxsize=QUEUE_MAXSIZE)
     stop_event = Event()
@@ -999,16 +1114,23 @@ def main() -> int:
             NUM_CLASSES,
             MODEL_PATH,
             DEVICE_STR,
-            class_summary_path,   # 新增：各类汇总文件路径
+            class_summary_path,
+            windows_npz_path,
         ),
         name="InferenceWorker",
         daemon=False,
     )
 
+    _win_msg = (
+        f"  推理窗保存: {windows_npz_path.name}（最多 {MAX_SAVED_WINDOWS} 条）\n"
+        if windows_npz_path is not None
+        else "  推理窗保存: 关\n"
+    )
     print(
         f"[主进程] {datetime.now():%Y-%m-%d %H:%M:%S} 启动闭环测评\n"
         f"  架构: {SelectModel.upper()} | 权重: {UseModel} | 模型文件: {MODEL_PATH}\n"
         f"  每类目标={DIAGNOSES_PER_CLASS} 次推理 | 汇总文件: {class_summary_path.name}\n"
+        f"{_win_msg}"
         f"  队列容量={QUEUE_MAXSIZE}（满则丢最旧）| "
         f"每包 {DOUBLES_PER_PACKET} doubles（1 标签 + {SIGNAL_DOUBLES_PER_PACKET} 信号）| "
         f"空闲≥{UDP_IDLE_TIMEOUT_SEC:.1f}s 无有效 UDP 则自动退出"
@@ -1025,16 +1147,18 @@ def main() -> int:
 
     except KeyboardInterrupt:
         user_interrupt = True
-        print("\n[主进程] KeyboardInterrupt，正在停止子进程…", file=sys.stderr)
+        print("\n[主进程] KeyboardInterrupt，正在停止子进程…", flush=True)
         stop_event.set()
-        recv_proc.join(timeout=3.0)
-        inf_proc.join(timeout=10.0)
+        recv_proc.join(timeout=5.0)
+        # 给推理进程足够时间跑完 finally 并 put 汇总（否则控制台拿不到各类明细表）
+        inf_proc.join(timeout=45.0)
         if recv_proc.is_alive():
             recv_proc.terminate()
         if inf_proc.is_alive():
+            print("[主进程] 推理进程未及时退出，发送 terminate…", flush=True)
             inf_proc.terminate()
-        recv_proc.join(timeout=2.0)
-        inf_proc.join(timeout=2.0)
+        recv_proc.join(timeout=3.0)
+        inf_proc.join(timeout=5.0)
 
     except Exception as e:
         print(f"[主进程] 异常: {e}", file=sys.stderr)
@@ -1059,10 +1183,20 @@ def main() -> int:
             f"已连续 ≥{UDP_IDLE_TIMEOUT_SEC:.1f}s 未收到有效 UDP，接收进程已停止（或子进程已正常结束）"
         )
 
-    stats = fetch_stats_from_queue(stats_queue)
+    stats = fetch_stats_from_queue(
+        stats_queue,
+        retries=120 if user_interrupt else 40,
+        sleep_s=0.08 if user_interrupt else 0.05,
+    )
     if stats is None:
         stats = {"ok": False, "error": "无统计（进程可能被强制结束或推理尚未写入汇总）"}
     print_session_summary(stats, metrics_path, reason=summary_reason)
+    if user_interrupt and stats and stats.get("ok") and not stats.get("per_class"):
+        print(
+            "[主进程] 提示: 未收到 per_class 明细（推理进程可能被过早终止）。"
+            "可适当延长中断后的等待或避免对推理进程 terminate。",
+            flush=True,
+        )
     return 0
 
 
