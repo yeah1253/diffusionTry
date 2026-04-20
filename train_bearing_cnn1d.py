@@ -29,6 +29,8 @@
   默认        train_two_models()   — model_mixed_<type>.pth + model_real_only_<type>.pth
   --single    train()              — best_model_<type>.pth（传统单模型，窗口级划分）
   --eval-only eval_only()          — 仅评估 best_model_<type>.pth
+  --export-head-features            — 从已有双模型权重导出 offline_classifier_heads_<type>.npz
+  双模型训练结束且 AUTO_EXPORT_CLASSIFIER_HEAD_NPZ 为真时，自动在共用测试集上导出上述 npz（非 RF）。
 """
 
 from __future__ import annotations
@@ -107,6 +109,9 @@ EXPECTED_NUM_CLASSES        = 10
 OUTPUT_MODEL_PATH           = f"best_model_{MODEL_TYPE}.pth"
 OUTPUT_MODEL_PATH_MIXED     = f"model_mixed_{MODEL_TYPE}.pth"
 OUTPUT_MODEL_PATH_REAL_ONLY = f"model_real_only_{MODEL_TYPE}.pth"
+# 双模型训练结束后是否自动导出共用测试集上两套分类器头特征（供 plot_udp_windows_tsne 与在线对比）
+AUTO_EXPORT_CLASSIFIER_HEAD_NPZ = True
+OFFLINE_CLASSIFIER_HEADS_NPZ = f"offline_classifier_heads_{MODEL_TYPE}.npz"
 
 # 生成过程元数据文件，不进入训练集
 _GEN_SKIP_FILES = {"kl_scores.npy", "selected_idx.npy", "all_generated.npy"}
@@ -609,6 +614,180 @@ def evaluate_accuracy(model, data_loader, device) -> float:
     return correct / max(total, 1)
 
 
+def _load_checkpoint_model(ckpt_path: Path, device, num_classes: int):
+    """加载双模型 checkpoint：PyTorch 返回 eval 模块；RF 返回 BearingRFWrapper。"""
+    import torch
+    from model import ARCH_CNN, ARCH_RF, BearingRFWrapper, build_model
+
+    ckpt_path = Path(ckpt_path)
+    if not ckpt_path.is_file():
+        raise FileNotFoundError(str(ckpt_path.resolve()))
+    try:
+        ck = torch.load(str(ckpt_path), map_location=device, weights_only=False)
+    except TypeError:
+        ck = torch.load(str(ckpt_path), map_location=device)
+
+    arch = ck.get("architecture") or ARCH_CNN
+    nc = int(ck.get("num_classes", num_classes))
+    if arch == ARCH_RF and "rf_wrapper" in ck:
+        w = ck["rf_wrapper"]
+        if not isinstance(w, BearingRFWrapper):
+            raise TypeError("checkpoint rf_wrapper 类型异常")
+        return w, ck
+    if "state_dict" not in ck:
+        raise KeyError(f"{ckpt_path.name} 中无 state_dict")
+    m = build_model(arch, nc).to(device)
+    m.load_state_dict(ck["state_dict"], strict=True)
+    m.eval()
+    return m, ck
+
+
+def _collect_classifier_head_features(
+    model,
+    data_loader,
+    device,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    遍历 data_loader，返回 (H, preds, y)，均为 numpy、行顺序与 loader 一致。
+    H 为分类器 Linear 前的特征 (N, D)；preds / y 为 (N,) int64。
+    """
+    import torch
+    import torch.nn as nn
+    from model import BearingRFWrapper, extract_classifier_input_features
+
+    h_list: list[np.ndarray] = []
+    p_list: list[np.ndarray] = []
+    y_list: list[np.ndarray] = []
+
+    if isinstance(model, BearingRFWrapper):
+        model.eval()
+        with torch.no_grad():
+            for xb, yb in data_loader:
+                xb = xb.to(device)
+                h = extract_classifier_input_features(model, xb)
+                hn = h.detach().cpu().numpy().astype(np.float32, copy=False)
+                proba = model.rf.predict_proba(hn)
+                pr = np.argmax(proba, axis=1).astype(np.int64, copy=False)
+                h_list.append(hn)
+                p_list.append(pr)
+                y_list.append(yb.numpy().astype(np.int64, copy=False))
+    elif isinstance(model, nn.Module):
+        model.eval()
+        with torch.no_grad():
+            for xb, yb in data_loader:
+                xb = xb.to(device)
+                h = extract_classifier_input_features(model, xb)
+                clf = getattr(model, "classifier", None)
+                if isinstance(clf, nn.Linear):
+                    logits = clf(h)
+                elif hasattr(model, "fc") and isinstance(getattr(model, "fc"), nn.Linear):
+                    logits = model.fc(h)
+                else:
+                    logits = model(xb)
+                pr = logits.argmax(dim=-1).cpu().numpy().astype(np.int64, copy=False)
+                hn = h.detach().cpu().numpy().astype(np.float32, copy=False)
+                h_list.append(hn)
+                p_list.append(pr)
+                y_list.append(yb.numpy().astype(np.int64, copy=False))
+    else:
+        raise TypeError(f"不支持的模型类型: {type(model).__name__}")
+
+    if not h_list:
+        z = np.zeros((0, 1), dtype=np.float32)
+        e = np.array([], dtype=np.int64)
+        return z, e, e
+    return (
+        np.concatenate(h_list, axis=0),
+        np.concatenate(p_list, axis=0),
+        np.concatenate(y_list, axis=0),
+    )
+
+
+def export_dual_classifier_head_npz(
+    window_index: list,
+    class_names: list[str],
+    cache: dict,
+    path_mixed: Path,
+    path_real_only: Path,
+    out_npz: Path,
+    device,
+    *,
+    split_name: str,
+    batch_size: int | None = None,
+) -> int:
+    """
+    在同一批窗口上分别用「混合训练」「纯真实训练」权重提取分类器头特征并写入 npz：
+      X_mixed, X_real_only, y（三者行一一对应）, pred_mixed, pred_real_only
+    """
+    import torch
+    from torch.utils.data import DataLoader
+
+    if not window_index:
+        print(f"[导出] 窗口索引为空（split={split_name}），跳过。", file=sys.stderr)
+        return 1
+
+    num_classes = len(class_names)
+    bs = batch_size if batch_size is not None else BATCH_SIZE
+
+    def collate(batch):
+        import torch as _t
+        return (
+            _t.stack([b[0] for b in batch]),
+            _t.tensor([b[1] for b in batch], dtype=_t.long),
+        )
+
+    dl = DataLoader(
+        BearingNpyWindowDataset(list(window_index), cache, NORMALIZE_PER_WINDOW),
+        batch_size=bs,
+        shuffle=False,
+        num_workers=0,
+        collate_fn=collate,
+    )
+
+    try:
+        model_m, ck_m = _load_checkpoint_model(path_mixed, device, num_classes)
+        model_r, ck_r = _load_checkpoint_model(path_real_only, device, num_classes)
+    except Exception as e:
+        print(f"[导出] 加载 checkpoint 失败: {e}", file=sys.stderr)
+        return 1
+
+    print(f"[导出] 提取分类器头特征 split={split_name} | N={len(window_index)} …")
+    try:
+        Xm, pm, ym = _collect_classifier_head_features(model_m, dl, device)
+        Xr, pr, yr = _collect_classifier_head_features(model_r, dl, device)
+    except Exception as e:
+        print(f"[导出] 前向失败: {e}", file=sys.stderr)
+        return 1
+
+    if Xm.shape[0] != Xr.shape[0] or not (np.array_equal(ym, yr)):
+        print("[导出] 两套特征行数或标签不一致，放弃写入。", file=sys.stderr)
+        return 1
+
+    out_npz = Path(out_npz)
+    np.savez_compressed(
+        str(out_npz),
+        X_mixed=np.ascontiguousarray(Xm, dtype=np.float32),
+        X_real_only=np.ascontiguousarray(Xr, dtype=np.float32),
+        y=np.ascontiguousarray(ym, dtype=np.int64),
+        pred_mixed=np.ascontiguousarray(pm, dtype=np.int64),
+        pred_real_only=np.ascontiguousarray(pr, dtype=np.int64),
+        num_classes=np.int32(num_classes),
+        feat_dim_mixed=np.int32(Xm.shape[1]),
+        feat_dim_real_only=np.int32(Xr.shape[1]),
+        split=np.array(split_name),
+        feature_kind=np.array("classifier_input"),
+        window_size=np.int32(WINDOW_SIZE),
+        normalize_per_window=np.asarray(NORMALIZE_PER_WINDOW),
+        class_names=np.array(class_names, dtype=object),
+        path_mixed=np.array(str(path_mixed.resolve())),
+        path_real_only=np.array(str(path_real_only.resolve())),
+        architecture_mixed=np.array(str(ck_m.get("architecture", ""))),
+        architecture_real_only=np.array(str(ck_r.get("architecture", ""))),
+    )
+    print(f"[导出] 已写入 {out_npz.resolve()} | D_mixed={Xm.shape[1]} D_real={Xr.shape[1]}")
+    return 0
+
+
 def _get_all_predictions(
     model, data_loader, device
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -907,6 +1086,57 @@ def train_one_model(
     return test_acc
 
 
+def export_head_features_standalone(split: str) -> int:
+    """
+    仅导出：读取已有 model_mixed / model_real_only，在共用 val 或 test 窗口上写
+    OFFLINE_CLASSIFIER_HEADS_NPZ（与训练结束自动导出内容相同）。
+    """
+    set_seed(SEED)
+    try:
+        import torch
+    except ImportError:
+        print("[错误] 需要 PyTorch: pip install torch", file=sys.stderr)
+        return 1
+
+    device = torch.device(DEVICE if torch.cuda.is_available() else "cpu")
+    root_real = Path(DATA_ROOT)
+    root_gen = Path(GEN_DATA_ROOT)
+    sig_cache: dict[str, np.ndarray] = {}
+    rng_build = random.Random(SEED)
+    try:
+        (_mixed_idx, _real_idx, shared_val_idx, shared_test_idx,
+         class_names, _test_cond_keys) = build_file_level_indices(
+            root_real, root_gen, rng_build, sig_cache
+        )
+    except Exception as e:
+        print(f"[导出] 构建索引失败: {e}", file=sys.stderr)
+        return 1
+
+    idx = shared_test_idx if split == "test" else shared_val_idx
+    if not idx:
+        print(f"[错误] 共用{'测试' if split == 'test' else '验证'}集为空。", file=sys.stderr)
+        return 1
+
+    out_mixed = SCRIPT_DIR / OUTPUT_MODEL_PATH_MIXED
+    out_real = SCRIPT_DIR / OUTPUT_MODEL_PATH_REAL_ONLY
+    out_npz = SCRIPT_DIR / OFFLINE_CLASSIFIER_HEADS_NPZ
+
+    if MODEL_TYPE.lower() == "rf":
+        print("[错误] RF 模式下手写特征与模型权重无关，无需双文件导出；请改用 PyTorch 架构。", file=sys.stderr)
+        return 1
+
+    return export_dual_classifier_head_npz(
+        idx,
+        class_names,
+        sig_cache,
+        out_mixed,
+        out_real,
+        out_npz,
+        device,
+        split_name=split,
+    )
+
+
 # =============================================================================
 # 双模型训练主入口（默认运行模式）
 # =============================================================================
@@ -1004,6 +1234,30 @@ def train_two_models() -> int:
     print(f'    MODEL_PATH = "{OUTPUT_MODEL_PATH_MIXED}"')
     print(f'    MODEL_PATH = "{OUTPUT_MODEL_PATH_REAL_ONLY}"')
     print("=" * 60)
+
+    if AUTO_EXPORT_CLASSIFIER_HEAD_NPZ and not use_rf:
+        out_heads = SCRIPT_DIR / OFFLINE_CLASSIFIER_HEADS_NPZ
+        if out_mixed.is_file() and out_real.is_file():
+            export_dual_classifier_head_npz(
+                shared_test_idx,
+                class_names,
+                sig_cache,
+                out_mixed,
+                out_real,
+                out_heads,
+                device,
+                split_name="test",
+            )
+            print(
+                f"\n[提示] 与在线特征同图 t-SNE 时，使用 plot_udp_windows_tsne.py：\n"
+                f"  --offline-npz {out_heads.name} --offline-source mixed|real_only\n"
+                f"  叉号=离线所选权重，圆点= --npz 在线 UDP 特征"
+            )
+        else:
+            print("[警告] 混合/纯真实 checkpoint 缺失，跳过分类器头特征导出。", file=sys.stderr)
+    elif AUTO_EXPORT_CLASSIFIER_HEAD_NPZ and use_rf:
+        print("[信息] RF 模式跳过分类器头 npz 自动导出。")
+
     return 0
 
 
@@ -1397,6 +1651,7 @@ if __name__ == "__main__":
   默认              train_two_models()  — 生成 model_mixed_<type>.pth + model_real_only_<type>.pth
   --single          train()             — 传统单模型训练（窗口级划分），生成 best_model_<type>.pth
   --eval-only       eval_only()         — 仅加载 best_model_<type>.pth 评估
+  --export-head-features  从已有 model_mixed + model_real_only 导出离线双路头特征 npz
 
 架构切换：修改 model.py 顶部的 SelectModel 变量（不需要改动本文件）。
         """,
@@ -1405,8 +1660,21 @@ if __name__ == "__main__":
                         help="不训练，仅评估 best_model_<type>.pth")
     parser.add_argument("--single", action="store_true",
                         help="传统单模型训练（生成 best_model_<type>.pth）")
+    parser.add_argument(
+        "--export-head-features",
+        action="store_true",
+        help="不训练：在共用 test 或 val 上导出 offline_classifier_heads_<arch>.npz",
+    )
+    parser.add_argument(
+        "--split",
+        choices=("test", "val"),
+        default="test",
+        help="与 --export-head-features 联用：窗口来自共用测试集或验证集",
+    )
     args = parser.parse_args()
 
+    if args.export_head_features:
+        raise SystemExit(export_head_features_standalone(args.split))
     if args.eval_only:
         raise SystemExit(eval_only())
     elif args.single:
