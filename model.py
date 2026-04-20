@@ -10,7 +10,7 @@
   BearingResNet1D    — 4 块残差网络（Skip Connection + BN，深层表达力强）
   BearingShuffleNet1D— 3 阶段 ShuffleNet V2（分组卷积+通道洗牌，HIL 低延迟）
   BearingConformer   — CNN×2 + Transformer×4 混合（局部降噪→全局周期识别）
-  BearingConvNeXt1D  — ConvNeXt-1D（大核 DWConv + LayerNorm + GELU）
+  BearingMSDCNN      — 多尺度并行 1D-CNN（MSDCNN，多分支感受野融合）
   BearingRepVGG1D    — RepVGG-1D（训练多分支 / 部署单分支 3×1 Conv）
   BearingRFWrapper   — 随机森林（sklearn），兼容 PyTorch 推理接口
 
@@ -45,7 +45,7 @@ SelectModel: str = "cnn"
   "resnet"      — BearingResNet1D（残差网络，深层表达力强）
   "shufflenet"  — BearingShuffleNet1D（ShuffleNet V2，HIL 低延迟优先）
   "conformer"   — BearingConformer（CNN+Transformer 混合，推荐高精度）
-  "convnext"    — BearingConvNeXt1D（Modern CNN，大核 + LayerNorm + GELU）
+  "msdcnn"      — BearingMSDCNN（多尺度并行卷积，兼顾局部冲击与周期特征）
   "repvgg"      — BearingRepVGG1D（结构重参数化，HIL 推理可融合分支）
 """
 
@@ -62,7 +62,7 @@ ARCH_MOBILENET   = "mobilenet1d_bearing_v1"
 ARCH_RESNET      = "resnet1d_bearing_v1"
 ARCH_SHUFFLENET  = "shufflenet1d_bearing_v1"
 ARCH_CONFORMER   = "conformer_bearing_v1"
-ARCH_CONVNEXT    = "convnext1d_bearing_v1"
+ARCH_MSDCNN      = "msdcnn1d_bearing_v1"
 ARCH_REPVGG      = "repvgg1d_bearing_v1"
 ARCH_RF          = "rf_bearing_v1"
 
@@ -96,11 +96,11 @@ _ARCH_ALIASES: dict[str, str] = {
     "cnn_transformer":      ARCH_CONFORMER,
     "hybrid":               ARCH_CONFORMER,
     ARCH_CONFORMER:         ARCH_CONFORMER,
-    # ConvNeXt
-    "convnext":             ARCH_CONVNEXT,
-    "convnext1d":           ARCH_CONVNEXT,
-    "next":                 ARCH_CONVNEXT,
-    ARCH_CONVNEXT:          ARCH_CONVNEXT,
+    # MSDCNN
+    "msdcnn":               ARCH_MSDCNN,
+    "multi_scale":          ARCH_MSDCNN,
+    "multiscale":           ARCH_MSDCNN,
+    ARCH_MSDCNN:            ARCH_MSDCNN,
     # RepVGG
     "repvgg":               ARCH_REPVGG,
     "repvgg1d":             ARCH_REPVGG,
@@ -683,115 +683,117 @@ class BearingConformer(nn.Module):
 
 
 # =============================================================================
-# 模型 8：BearingConvNeXt1D — Modern CNN（大核 DWConv + LayerNorm + GELU）
+# 模型 8：BearingMSDCNN — Multi-Scale Deep CNN（多尺度并行卷积）
 # =============================================================================
 
-class _LayerNormChannelLast1D(nn.Module):
-    """对 (B, C, L) 张量沿通道维做 LayerNorm。"""
+class _MSDCNNBranch1D(nn.Module):
+    """单个多尺度分支：不同卷积核感受不同故障频带与周期结构。"""
 
-    def __init__(self, channels: int, eps: float = 1e-6):
+    def __init__(self, in_ch: int, out_ch: int, kernel_size: int, stride: int = 1):
         super().__init__()
-        self.norm = nn.LayerNorm(channels, eps=eps)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.norm(x.transpose(1, 2)).transpose(1, 2)
-
-
-class _ConvNeXtBlock1D(nn.Module):
-    """
-    ConvNeXt-1D 基本块：
-      DWConv(k=7) → LayerNorm → PW(4x) → GELU → PW → 残差
-    """
-
-    def __init__(self, dim: int, kernel_size: int = 7, layer_scale: float = 1e-6):
-        super().__init__()
-        self.dwconv = nn.Conv1d(
-            dim, dim, kernel_size=kernel_size, padding=kernel_size // 2,
-            groups=dim, bias=True,
+        pad = kernel_size // 2
+        self.branch = nn.Sequential(
+            nn.Conv1d(in_ch, out_ch, kernel_size, stride=stride, padding=pad, bias=False),
+            nn.BatchNorm1d(out_ch),
+            nn.GELU(),
+            nn.Conv1d(out_ch, out_ch, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm1d(out_ch),
+            nn.GELU(),
         )
-        self.norm = _LayerNormChannelLast1D(dim)
-        self.pwconv1 = nn.Conv1d(dim, 4 * dim, kernel_size=1, bias=True)
-        self.act = nn.GELU()
-        self.pwconv2 = nn.Conv1d(4 * dim, dim, kernel_size=1, bias=True)
-        self.gamma = nn.Parameter(layer_scale * torch.ones(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        residual = x
-        x = self.dwconv(x)
-        x = self.norm(x)
-        x = self.pwconv1(x)
-        x = self.act(x)
-        x = self.pwconv2(x)
-        x = x * self.gamma.view(1, -1, 1)
-        return residual + x
+        return self.branch(x)
 
 
-class BearingConvNeXt1D(nn.Module):
+class _MSDCNNBlock(nn.Module):
     """
-    ConvNeXt-1D，用现代 CNN 设计哲学处理 1024 点轴承振动窗。
+    MSDCNN 多尺度块：
+      并行 4 个卷积分支（k = 3 / 7 / 11 / 15）
+      → 通道拼接 → 1×1 融合 → 残差连接
+
+    小核更敏感于局部冲击脉冲，大核更利于覆盖故障周期与谐波调制。
+    """
+
+    _KERNELS = (3, 7, 11, 15)
+
+    def __init__(self, in_ch: int, out_ch: int, stride: int = 1):
+        super().__init__()
+        n_branches = len(self._KERNELS)
+        branch_ch = out_ch // n_branches
+        if branch_ch * n_branches != out_ch:
+            raise ValueError(f"out_ch={out_ch} 需能被分支数 {n_branches} 整除。")
+
+        self.branches = nn.ModuleList([
+            _MSDCNNBranch1D(in_ch, branch_ch, kernel_size=k, stride=stride)
+            for k in self._KERNELS
+        ])
+        self.fuse = nn.Sequential(
+            nn.Conv1d(out_ch, out_ch, kernel_size=1, bias=False),
+            nn.BatchNorm1d(out_ch),
+        )
+        if stride != 1 or in_ch != out_ch:
+            self.skip = nn.Sequential(
+                nn.Conv1d(in_ch, out_ch, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm1d(out_ch),
+            )
+        else:
+            self.skip = nn.Identity()
+        self.act = nn.GELU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        merged = torch.cat([branch(x) for branch in self.branches], dim=1)
+        return self.act(self.fuse(merged) + self.skip(x))
+
+
+class BearingMSDCNN(nn.Module):
+    """
+    MSDCNN（Multi-Scale Deep CNN），专为 1024 点轴承振动窗设计。
+
+    关键设计说明：
+      1. Stem 先用大核卷积对原始时域信号做初步降噪，并快速压缩长度。
+      2. 每个多尺度块内部包含 4 个并行卷积分支（k=3/7/11/15），
+         同时捕捉局部冲击、包络变化与更长周期的故障模式。
+      3. 各分支输出在通道维拼接后经 1×1 卷积融合，再与残差支路相加，
+         保持多分支并行计算能力，同时稳定深层训练。
 
     结构：
-      Stem   — Conv(k=4, s=4)                           [1024 → 256, ch:1→32]
-      Stage1 — 2 × ConvNeXtBlock1D(dim=32,  k=7)       [256 → 256]
-      Down1  — LayerNorm + Conv(k=2, s=2)              [256 → 128, ch:32→64]
-      Stage2 — 2 × ConvNeXtBlock1D(dim=64,  k=7)       [128 → 128]
-      Down2  — LayerNorm + Conv(k=2, s=2)              [128 →  64, ch:64→128]
-      Stage3 — 4 × ConvNeXtBlock1D(dim=128, k=7)       [ 64 →  64]
-      Down3  — LayerNorm + Conv(k=2, s=2)              [ 64 →  32, ch:128→256]
-      Stage4 — 2 × ConvNeXtBlock1D(dim=256, k=7)       [ 32 →  32]
-      GAP + LayerNorm + Linear(256 → num_classes)
+      Stem   — Conv(k=17, s=4) → BN → GELU             [1024 → 256, ch:1→32]
+      Block1 — MSDCNNBlock(32  → 64,  s=2)            [ 256 → 128]
+      Block2 — MSDCNNBlock(64  → 128, s=2)            [ 128 →  64]
+      Block3 — MSDCNNBlock(128 → 256, s=2)            [  64 →  32]
+      Block4 — MSDCNNBlock(256 → 256, s=1)            [  32 →  32]
+      GAP + Dropout + Linear(256 → num_classes)
 
     输入:  (B, 1, L=1024)
     输出:  (B, num_classes) logits
     """
 
-    _DIMS = [32, 64, 128, 256]
-    _DEPTHS = [2, 2, 4, 2]
-
     def __init__(self, num_classes: int = 10):
         super().__init__()
         self.num_classes = num_classes
 
-        dims = self._DIMS
-        depths = self._DEPTHS
-
         self.stem = nn.Sequential(
-            nn.Conv1d(1, dims[0], kernel_size=4, stride=4, bias=True),
-            _LayerNormChannelLast1D(dims[0]),
+            nn.Conv1d(1, 32, kernel_size=17, stride=4, padding=8, bias=False),
+            nn.BatchNorm1d(32),
+            nn.GELU(),
         )
-        self.stage1 = nn.Sequential(*[_ConvNeXtBlock1D(dims[0]) for _ in range(depths[0])])
-        self.down1 = nn.Sequential(
-            _LayerNormChannelLast1D(dims[0]),
-            nn.Conv1d(dims[0], dims[1], kernel_size=2, stride=2, bias=True),
+        self.blocks = nn.Sequential(
+            _MSDCNNBlock(32, 64, stride=2),
+            _MSDCNNBlock(64, 128, stride=2),
+            _MSDCNNBlock(128, 256, stride=2),
+            _MSDCNNBlock(256, 256, stride=1),
         )
-        self.stage2 = nn.Sequential(*[_ConvNeXtBlock1D(dims[1]) for _ in range(depths[1])])
-        self.down2 = nn.Sequential(
-            _LayerNormChannelLast1D(dims[1]),
-            nn.Conv1d(dims[1], dims[2], kernel_size=2, stride=2, bias=True),
-        )
-        self.stage3 = nn.Sequential(*[_ConvNeXtBlock1D(dims[2]) for _ in range(depths[2])])
-        self.down3 = nn.Sequential(
-            _LayerNormChannelLast1D(dims[2]),
-            nn.Conv1d(dims[2], dims[3], kernel_size=2, stride=2, bias=True),
-        )
-        self.stage4 = nn.Sequential(*[_ConvNeXtBlock1D(dims[3]) for _ in range(depths[3])])
-        self.norm = nn.LayerNorm(dims[-1], eps=1e-6)
-        self.classifier = nn.Linear(dims[-1], num_classes)
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.drop = nn.Dropout(0.10)
+        self.classifier = nn.Linear(256, num_classes)
 
     def forward_features(self, x: torch.Tensor) -> torch.Tensor:
         x = self.stem(x)
-        x = self.stage1(x)
-        x = self.down1(x)
-        x = self.stage2(x)
-        x = self.down2(x)
-        x = self.stage3(x)
-        x = self.down3(x)
-        x = self.stage4(x)
-        x = x.mean(dim=-1)
-        return self.norm(x)
+        x = self.blocks(x)
+        return self.pool(x).squeeze(-1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.classifier(self.forward_features(x))
+        return self.classifier(self.drop(self.forward_features(x)))
 
 
 # =============================================================================
@@ -1153,7 +1155,7 @@ def build_model(arch_or_type: str, num_classes: int) -> nn.Module:
       "resnet"     / "resnet1d"    / "resnet1d_bearing_v1"
       "shufflenet" / "shufflenet1d"/ "shufflenet1d_bearing_v1" / "shuffle"
       "conformer"  / "cnn_transformer" / "hybrid" / "conformer_bearing_v1"
-      "convnext"   / "convnext1d" / "convnext1d_bearing_v1" / "next"
+      "msdcnn"     / "multi_scale" / "multiscale" / "msdcnn1d_bearing_v1"
       "repvgg"     / "repvgg1d"   / "repvgg1d_bearing_v1" / "rep"
     """
     key = _ARCH_ALIASES.get(arch_or_type.lower(), arch_or_type)
@@ -1164,7 +1166,7 @@ def build_model(arch_or_type: str, num_classes: int) -> nn.Module:
     if key == ARCH_RESNET:      return BearingResNet1D(num_classes=num_classes)
     if key == ARCH_SHUFFLENET:  return BearingShuffleNet1D(num_classes=num_classes)
     if key == ARCH_CONFORMER:   return BearingConformer(num_classes=num_classes)
-    if key == ARCH_CONVNEXT:    return BearingConvNeXt1D(num_classes=num_classes)
+    if key == ARCH_MSDCNN:      return BearingMSDCNN(num_classes=num_classes)
     if key == ARCH_REPVGG:      return BearingRepVGG1D(num_classes=num_classes)
     if key == ARCH_RF:
         raise ValueError(
@@ -1224,9 +1226,9 @@ _HPARAMS: dict[str, dict] = {
         epochs=250, patience=20,
         warmup_epochs=10, grad_clip=1.0,  label_smoothing=0.10,
     ),
-    # ── ConvNeXt-1D：AdamW + LayerNorm 组合较稳，适度 warmup 防止前期震荡 ─────────
-    ARCH_CONVNEXT: dict(
-        lr=4e-4,    weight_decay=0.02,   batch_size=64,
+    # ── MSDCNN：多分支并行卷积，学习率参考 TCN，略增 weight decay 抑制过拟合 ─────
+    ARCH_MSDCNN: dict(
+        lr=6e-4,    weight_decay=1.5e-3, batch_size=64,
         epochs=250, patience=20,
         warmup_epochs=5,  grad_clip=1.0,  label_smoothing=0.08,
     ),
@@ -1274,7 +1276,7 @@ def count_feature_layers(model: nn.Module) -> int:
       ResNet1D    → 残差块数（4）
       ShuffleNet  → 全部 ShuffleBlock 总数（stage1+2+3 = 2+3+4 = 9）
       Conformer   → CNN 层数 + Transformer Encoder 层数（2+4 = 6）
-      ConvNeXt1D  → 全部 ConvNeXt Block 总数（2+2+4+2 = 10）
+      MSDCNN      → 多尺度卷积块数（4）
       RepVGG1D    → stem + 各 Stage block 总数（1+2+2+4+1 = 10）
     """
     if isinstance(model, BearingCNN1D):
@@ -1294,11 +1296,8 @@ def count_feature_layers(model: nn.Module) -> int:
         # CNN 层数 + Transformer Encoder 层数
         n_cnn = sum(1 for m in model.cnn_stem.children() if isinstance(m, nn.Conv1d))
         return n_cnn + len(model.encoder.layers)
-    if isinstance(model, BearingConvNeXt1D):
-        return (
-            len(model.stage1) + len(model.stage2)
-            + len(model.stage3) + len(model.stage4)
-        )
+    if isinstance(model, BearingMSDCNN):
+        return len(model.blocks)
     if isinstance(model, BearingRepVGG1D):
         return (
             1 + len(model.stage1) + len(model.stage2)
@@ -1342,7 +1341,7 @@ def extract_classifier_input_features(model: nn.Module, x: torch.Tensor) -> torc
             xc = model.cnn_stem(x).permute(0, 2, 1)
             xc = model.encoder(xc + model.pos_embed)
             return model.norm(xc.mean(dim=1))
-        if isinstance(model, BearingConvNeXt1D):
+        if isinstance(model, BearingMSDCNN):
             return model.forward_features(x)
         if isinstance(model, BearingRepVGG1D):
             return model.forward_features(x)

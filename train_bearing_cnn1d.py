@@ -16,8 +16,10 @@
   5. 模型 2 的训练集 = 模型 1 训练集的 .mat 精确子集（包括边缘工况的极少样本）。
   6. 评估时额外输出按曼哈顿距离分组的准确率（核心 / 过渡 / 边缘独立精度）。
   7. 支持 9 种神经网络架构（CNN / Transformer / TCN / MobileNet / ResNet /
-     ShuffleNet / Conformer / ConvNeXt / RepVGG），由 model.py 中的
-     SelectModel 变量统一控制；RepVGG checkpoint 会写入标准 architecture
+     ShuffleNet / Conformer / MSDCNN / RepVGG），由 model.py 中的
+     SelectModel 变量统一控制；其中 SelectModel="msdcnn" 时，输出文件名会
+     自动生成为 best_model_msdcnn.pth / model_mixed_msdcnn.pth /
+     model_real_only_msdcnn.pth；RepVGG checkpoint 会写入标准 architecture
      字段，便于 HIL / 推理脚本自动识别并部署。
 
 数据假设：
