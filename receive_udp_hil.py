@@ -60,6 +60,8 @@ QUEUE_MAXSIZE = 24
 #   "resnet"      — BearingResNet1D     残差网络（深层表达力强）
 #   "shufflenet"  — BearingShuffleNet1D ShuffleNet V2（HIL 低延迟优先）
 #   "conformer"   — BearingConformer    CNN+Transformer 混合（推荐高精度）
+#   "convnext"    — BearingConvNeXt1D   Modern CNN（大核 DWConv + LayerNorm）
+#   "repvgg"      — BearingRepVGG1D     结构重参数化 CNN（HIL 加载后自动融合）
 SelectModel = "cnn"
 
 # ── ★ 权重选择 ★ ───────────────────────────────────────────────────────────────
@@ -243,7 +245,8 @@ def load_diagnostic_model(model_path: str, num_classes: int):
     """
     在**当前进程**内加载模型（子进程须各自调用，勿跨进程传递 nn.Module）。
 
-    支持从 model.py 导出的全部架构（CNN / LSTM / Transformer / RF），
+    支持从 model.py 导出的全部架构（CNN / Transformer / TCN / MobileNet /
+    ResNet / ShuffleNet / Conformer / ConvNeXt / RepVGG / RF），
     也兼容仅用 bearing_models.py 保存的旧版 CNN checkpoint。
     """
     try:
@@ -253,9 +256,16 @@ def load_diagnostic_model(model_path: str, num_classes: int):
         print("[错误] 未安装 PyTorch，请执行: pip install torch", file=sys.stderr)
         return None
 
-    # 尝试导入新架构模块（model.py v3：支持 CNN/Transformer/TCN/MobileNet/ResNet/ShuffleNet/Conformer）
+    # 尝试导入新架构模块（model.py v3：支持 CNN/Transformer/TCN/MobileNet/ResNet/
+    # ShuffleNet/Conformer/ConvNeXt/RepVGG）
     try:
-        from model import build_model, BearingRFWrapper, ARCH_RF, _ARCH_ALIASES
+        from model import (
+            build_model,
+            BearingRFWrapper,
+            ARCH_RF,
+            _ARCH_ALIASES,
+            maybe_switch_model_to_deploy,
+        )
         _model_ok = True
     except ImportError:
         _model_ok    = False
@@ -289,6 +299,8 @@ def load_diagnostic_model(model_path: str, num_classes: int):
 
     # ── 直接存储的 nn.Module ──
     if isinstance(obj, nn.Module):
+        if _model_ok:
+            obj = maybe_switch_model_to_deploy(obj)
         obj.to(DEVICE_STR)
         obj.eval()
         print(f"[信息] 已加载 nn.Module: {path}")
@@ -307,7 +319,8 @@ def load_diagnostic_model(model_path: str, num_classes: int):
                 print(f"[信息] 类别顺序: {names}")
             return wrapper
 
-        # ── PyTorch 神经网络（CNN / Transformer / TCN / MobileNet / ResNet / ShuffleNet / Conformer）──
+        # ── PyTorch 神经网络（CNN / Transformer / TCN / MobileNet / ResNet /
+        #    ShuffleNet / Conformer / ConvNeXt / RepVGG）──
         if "state_dict" in obj:
             try:
                 if _model_ok and arch is not None and arch in _ARCH_ALIASES:
@@ -329,6 +342,8 @@ def load_diagnostic_model(model_path: str, num_classes: int):
                         return m
 
                 m.load_state_dict(obj["state_dict"], strict=True)
+                if _model_ok:
+                    m = maybe_switch_model_to_deploy(m)
                 m.to(DEVICE_STR)
                 m.eval()
                 print(f"[信息] 已加载 {arch} checkpoint: {path} | num_classes={nc}")
@@ -340,6 +355,8 @@ def load_diagnostic_model(model_path: str, num_classes: int):
 
         if "model" in obj and isinstance(obj["model"], nn.Module):
             m = obj["model"]
+            if _model_ok:
+                m = maybe_switch_model_to_deploy(m)
             m.to(DEVICE_STR)
             m.eval()
             print(f"[信息] 已从 checkpoint 字段 'model' 加载: {path}")

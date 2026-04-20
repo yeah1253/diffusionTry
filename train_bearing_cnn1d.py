@@ -15,7 +15,10 @@
        dist 0（核心 1800rpm/40load）→ 50% 真实；dist 4（最边缘）→ 0% 真实。
   5. 模型 2 的训练集 = 模型 1 训练集的 .mat 精确子集（包括边缘工况的极少样本）。
   6. 评估时额外输出按曼哈顿距离分组的准确率（核心 / 过渡 / 边缘独立精度）。
-  7. 支持 5 种架构，由 model.py 中的 SelectModel 变量统一控制。
+  7. 支持 9 种神经网络架构（CNN / Transformer / TCN / MobileNet / ResNet /
+     ShuffleNet / Conformer / ConvNeXt / RepVGG），由 model.py 中的
+     SelectModel 变量统一控制；RepVGG checkpoint 会写入标准 architecture
+     字段，便于 HIL / 推理脚本自动识别并部署。
 
 数据假设：
   真实数据：DATA_ROOT/<类别>/**/*.mat

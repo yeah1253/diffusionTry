@@ -2,7 +2,7 @@
 """
 轴承故障诊断对比实验模型库（v3）。
 
-包含 7 种 PyTorch 模型：
+包含 9 种 PyTorch 模型：
   BearingCNN1D       — 4 层标准 1D-CNN（基线，旧 checkpoint 可直接加载）
   BearingTransformer — 4 层 Patch-ViT Transformer Encoder（全局注意力）
   BearingTCN         — 4 层扩张残差 TCN（dilation=4^i，感受野≈1021）
@@ -10,6 +10,8 @@
   BearingResNet1D    — 4 块残差网络（Skip Connection + BN，深层表达力强）
   BearingShuffleNet1D— 3 阶段 ShuffleNet V2（分组卷积+通道洗牌，HIL 低延迟）
   BearingConformer   — CNN×2 + Transformer×4 混合（局部降噪→全局周期识别）
+  BearingConvNeXt1D  — ConvNeXt-1D（大核 DWConv + LayerNorm + GELU）
+  BearingRepVGG1D    — RepVGG-1D（训练多分支 / 部署单分支 3×1 Conv）
   BearingRFWrapper   — 随机森林（sklearn），兼容 PyTorch 推理接口
 
 所有 PyTorch 模型统一接受 (B, 1, L=1024)，输出 (B, num_classes) logits。
@@ -26,6 +28,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 # =============================================================================
 # ★ 全局模型选择变量 ★
@@ -41,6 +44,8 @@ SelectModel: str = "mobilenet"
   "resnet"      — BearingResNet1D（残差网络，深层表达力强）
   "shufflenet"  — BearingShuffleNet1D（ShuffleNet V2，HIL 低延迟优先）
   "conformer"   — BearingConformer（CNN+Transformer 混合，推荐高精度）
+  "convnext"    — BearingConvNeXt1D（Modern CNN，大核 + LayerNorm + GELU）
+  "repvgg"      — BearingRepVGG1D（结构重参数化，HIL 推理可融合分支）
 """
 
 # =============================================================================
@@ -56,6 +61,8 @@ ARCH_MOBILENET   = "mobilenet1d_bearing_v1"
 ARCH_RESNET      = "resnet1d_bearing_v1"
 ARCH_SHUFFLENET  = "shufflenet1d_bearing_v1"
 ARCH_CONFORMER   = "conformer_bearing_v1"
+ARCH_CONVNEXT    = "convnext1d_bearing_v1"
+ARCH_REPVGG      = "repvgg1d_bearing_v1"
 ARCH_RF          = "rf_bearing_v1"
 
 _ARCH_ALIASES: dict[str, str] = {
@@ -88,6 +95,16 @@ _ARCH_ALIASES: dict[str, str] = {
     "cnn_transformer":      ARCH_CONFORMER,
     "hybrid":               ARCH_CONFORMER,
     ARCH_CONFORMER:         ARCH_CONFORMER,
+    # ConvNeXt
+    "convnext":             ARCH_CONVNEXT,
+    "convnext1d":           ARCH_CONVNEXT,
+    "next":                 ARCH_CONVNEXT,
+    ARCH_CONVNEXT:          ARCH_CONVNEXT,
+    # RepVGG
+    "repvgg":               ARCH_REPVGG,
+    "repvgg1d":             ARCH_REPVGG,
+    "rep":                  ARCH_REPVGG,
+    ARCH_REPVGG:            ARCH_REPVGG,
     # RF
     "rf":                   ARCH_RF,
     "forest":               ARCH_RF,
@@ -665,6 +682,308 @@ class BearingConformer(nn.Module):
 
 
 # =============================================================================
+# 模型 8：BearingConvNeXt1D — Modern CNN（大核 DWConv + LayerNorm + GELU）
+# =============================================================================
+
+class _LayerNormChannelLast1D(nn.Module):
+    """对 (B, C, L) 张量沿通道维做 LayerNorm。"""
+
+    def __init__(self, channels: int, eps: float = 1e-6):
+        super().__init__()
+        self.norm = nn.LayerNorm(channels, eps=eps)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.norm(x.transpose(1, 2)).transpose(1, 2)
+
+
+class _ConvNeXtBlock1D(nn.Module):
+    """
+    ConvNeXt-1D 基本块：
+      DWConv(k=7) → LayerNorm → PW(4x) → GELU → PW → 残差
+    """
+
+    def __init__(self, dim: int, kernel_size: int = 7, layer_scale: float = 1e-6):
+        super().__init__()
+        self.dwconv = nn.Conv1d(
+            dim, dim, kernel_size=kernel_size, padding=kernel_size // 2,
+            groups=dim, bias=True,
+        )
+        self.norm = _LayerNormChannelLast1D(dim)
+        self.pwconv1 = nn.Conv1d(dim, 4 * dim, kernel_size=1, bias=True)
+        self.act = nn.GELU()
+        self.pwconv2 = nn.Conv1d(4 * dim, dim, kernel_size=1, bias=True)
+        self.gamma = nn.Parameter(layer_scale * torch.ones(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = x
+        x = self.dwconv(x)
+        x = self.norm(x)
+        x = self.pwconv1(x)
+        x = self.act(x)
+        x = self.pwconv2(x)
+        x = x * self.gamma.view(1, -1, 1)
+        return residual + x
+
+
+class BearingConvNeXt1D(nn.Module):
+    """
+    ConvNeXt-1D，用现代 CNN 设计哲学处理 1024 点轴承振动窗。
+
+    结构：
+      Stem   — Conv(k=4, s=4)                           [1024 → 256, ch:1→32]
+      Stage1 — 2 × ConvNeXtBlock1D(dim=32,  k=7)       [256 → 256]
+      Down1  — LayerNorm + Conv(k=2, s=2)              [256 → 128, ch:32→64]
+      Stage2 — 2 × ConvNeXtBlock1D(dim=64,  k=7)       [128 → 128]
+      Down2  — LayerNorm + Conv(k=2, s=2)              [128 →  64, ch:64→128]
+      Stage3 — 4 × ConvNeXtBlock1D(dim=128, k=7)       [ 64 →  64]
+      Down3  — LayerNorm + Conv(k=2, s=2)              [ 64 →  32, ch:128→256]
+      Stage4 — 2 × ConvNeXtBlock1D(dim=256, k=7)       [ 32 →  32]
+      GAP + LayerNorm + Linear(256 → num_classes)
+
+    输入:  (B, 1, L=1024)
+    输出:  (B, num_classes) logits
+    """
+
+    _DIMS = [32, 64, 128, 256]
+    _DEPTHS = [2, 2, 4, 2]
+
+    def __init__(self, num_classes: int = 10):
+        super().__init__()
+        self.num_classes = num_classes
+
+        dims = self._DIMS
+        depths = self._DEPTHS
+
+        self.stem = nn.Sequential(
+            nn.Conv1d(1, dims[0], kernel_size=4, stride=4, bias=True),
+            _LayerNormChannelLast1D(dims[0]),
+        )
+        self.stage1 = nn.Sequential(*[_ConvNeXtBlock1D(dims[0]) for _ in range(depths[0])])
+        self.down1 = nn.Sequential(
+            _LayerNormChannelLast1D(dims[0]),
+            nn.Conv1d(dims[0], dims[1], kernel_size=2, stride=2, bias=True),
+        )
+        self.stage2 = nn.Sequential(*[_ConvNeXtBlock1D(dims[1]) for _ in range(depths[1])])
+        self.down2 = nn.Sequential(
+            _LayerNormChannelLast1D(dims[1]),
+            nn.Conv1d(dims[1], dims[2], kernel_size=2, stride=2, bias=True),
+        )
+        self.stage3 = nn.Sequential(*[_ConvNeXtBlock1D(dims[2]) for _ in range(depths[2])])
+        self.down3 = nn.Sequential(
+            _LayerNormChannelLast1D(dims[2]),
+            nn.Conv1d(dims[2], dims[3], kernel_size=2, stride=2, bias=True),
+        )
+        self.stage4 = nn.Sequential(*[_ConvNeXtBlock1D(dims[3]) for _ in range(depths[3])])
+        self.norm = nn.LayerNorm(dims[-1], eps=1e-6)
+        self.classifier = nn.Linear(dims[-1], num_classes)
+
+    def forward_features(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.stem(x)
+        x = self.stage1(x)
+        x = self.down1(x)
+        x = self.stage2(x)
+        x = self.down2(x)
+        x = self.stage3(x)
+        x = self.down3(x)
+        x = self.stage4(x)
+        x = x.mean(dim=-1)
+        return self.norm(x)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.classifier(self.forward_features(x))
+
+
+# =============================================================================
+# 模型 9：BearingRepVGG1D — 结构重参数化 1D 卷积网络
+# =============================================================================
+
+class _RepVGGBlock1D(nn.Module):
+    """
+    RepVGG-1D 基本块。
+
+    训练阶段：
+      3×1 Conv + BN
+      1×1 Conv + BN
+      Identity + BN（仅 stride=1 且通道匹配）
+    推理阶段：
+      融合为单路 3×1 Conv（bias=True）
+    """
+
+    def __init__(self, in_ch: int, out_ch: int, stride: int = 1, deploy: bool = False):
+        super().__init__()
+        self.in_ch = in_ch
+        self.out_ch = out_ch
+        self.stride = stride
+        self.deploy = deploy
+        self.act = nn.ReLU(inplace=True)
+
+        if deploy:
+            self.rbr_reparam = nn.Conv1d(
+                in_ch, out_ch, kernel_size=3, stride=stride, padding=1, bias=True,
+            )
+        else:
+            self.rbr_dense = nn.Sequential(
+                nn.Conv1d(in_ch, out_ch, kernel_size=3, stride=stride, padding=1, bias=False),
+                nn.BatchNorm1d(out_ch),
+            )
+            self.rbr_1x1 = nn.Sequential(
+                nn.Conv1d(in_ch, out_ch, kernel_size=1, stride=stride, padding=0, bias=False),
+                nn.BatchNorm1d(out_ch),
+            )
+            self.rbr_identity = (
+                nn.BatchNorm1d(in_ch) if (stride == 1 and in_ch == out_ch) else None
+            )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.deploy:
+            return self.act(self.rbr_reparam(x))
+
+        out = self.rbr_dense(x) + self.rbr_1x1(x)
+        if self.rbr_identity is not None:
+            out = out + self.rbr_identity(x)
+        return self.act(out)
+
+    @staticmethod
+    def _fuse_bn_tensor(branch, in_ch: int, out_ch: int, device, dtype) -> tuple[torch.Tensor, torch.Tensor]:
+        if branch is None:
+            kernel = torch.zeros((out_ch, in_ch, 3), device=device, dtype=dtype)
+            bias = torch.zeros(out_ch, device=device, dtype=dtype)
+            return kernel, bias
+
+        if isinstance(branch, nn.Sequential):
+            conv = branch[0]
+            bn = branch[1]
+            kernel = conv.weight
+        else:
+            bn = branch
+            kernel = torch.zeros((out_ch, in_ch, 3), device=device, dtype=dtype)
+            for i in range(out_ch):
+                kernel[i, i, 1] = 1.0
+
+        running_mean = bn.running_mean
+        running_var = bn.running_var
+        gamma = bn.weight
+        beta = bn.bias
+        eps = bn.eps
+        std = torch.sqrt(running_var + eps)
+        scale = (gamma / std).reshape(-1, 1, 1)
+        return kernel * scale, beta - running_mean * gamma / std
+
+    def get_equivalent_kernel_bias(self) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.deploy:
+            return self.rbr_reparam.weight, self.rbr_reparam.bias
+
+        device = self.rbr_dense[0].weight.device
+        dtype = self.rbr_dense[0].weight.dtype
+
+        kernel3, bias3 = self._fuse_bn_tensor(
+            self.rbr_dense, self.in_ch, self.out_ch, device, dtype
+        )
+        kernel1, bias1 = self._fuse_bn_tensor(
+            self.rbr_1x1, self.in_ch, self.out_ch, device, dtype
+        )
+        kernel_id, bias_id = self._fuse_bn_tensor(
+            self.rbr_identity, self.in_ch, self.out_ch, device, dtype
+        )
+
+        kernel1 = F.pad(kernel1, [1, 1])
+        kernel = kernel3 + kernel1 + kernel_id
+        bias = bias3 + bias1 + bias_id
+        return kernel, bias
+
+    def switch_to_deploy(self) -> None:
+        if self.deploy:
+            return
+        kernel, bias = self.get_equivalent_kernel_bias()
+        rep = nn.Conv1d(
+            self.in_ch, self.out_ch, kernel_size=3, stride=self.stride, padding=1, bias=True,
+        )
+        rep.weight.data.copy_(kernel)
+        rep.bias.data.copy_(bias)
+        rep.to(device=kernel.device, dtype=kernel.dtype)
+        self.rbr_reparam = rep
+        del self.rbr_dense
+        del self.rbr_1x1
+        if self.rbr_identity is not None:
+            del self.rbr_identity
+        self.rbr_identity = None
+        self.deploy = True
+
+
+class BearingRepVGG1D(nn.Module):
+    """
+    RepVGG-1D，用于低延迟轴承故障诊断。
+
+    训练阶段使用多分支卷积增强表达能力；部署阶段通过 `switch_to_deploy()`
+    将每个块融合为单路 3×1 Conv，以降低边缘端推理延迟。
+
+    输入:  (B, 1, L=1024)
+    输出:  (B, num_classes) logits
+    """
+
+    _CHANNELS = [32, 64, 128, 256]
+    _BLOCKS = [2, 2, 4, 1]
+
+    def __init__(self, num_classes: int = 10, deploy: bool = False):
+        super().__init__()
+        self.num_classes = num_classes
+        self.deploy = deploy
+
+        c = self._CHANNELS
+        n = self._BLOCKS
+
+        self.stem = _RepVGGBlock1D(1, c[0], stride=2, deploy=deploy)
+        self.stage1 = self._make_stage(c[0], c[0], n[0], first_stride=2, deploy=deploy)
+        self.stage2 = self._make_stage(c[0], c[1], n[1], first_stride=2, deploy=deploy)
+        self.stage3 = self._make_stage(c[1], c[2], n[2], first_stride=2, deploy=deploy)
+        self.stage4 = self._make_stage(c[2], c[3], n[3], first_stride=2, deploy=deploy)
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.classifier = nn.Linear(c[-1], num_classes)
+
+    @staticmethod
+    def _make_stage(
+        in_ch: int, out_ch: int, num_blocks: int, first_stride: int, deploy: bool
+    ) -> nn.Sequential:
+        layers: list[nn.Module] = [
+            _RepVGGBlock1D(in_ch, out_ch, stride=first_stride, deploy=deploy)
+        ]
+        for _ in range(1, num_blocks):
+            layers.append(_RepVGGBlock1D(out_ch, out_ch, stride=1, deploy=deploy))
+        return nn.Sequential(*layers)
+
+    def forward_features(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.stem(x)
+        x = self.stage1(x)
+        x = self.stage2(x)
+        x = self.stage3(x)
+        x = self.stage4(x)
+        return self.pool(x).squeeze(-1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.classifier(self.forward_features(x))
+
+    def switch_to_deploy(self) -> "BearingRepVGG1D":
+        if self.deploy:
+            return self
+        for module in self.modules():
+            if isinstance(module, _RepVGGBlock1D):
+                module.switch_to_deploy()
+        self.deploy = True
+        return self
+
+
+def maybe_switch_model_to_deploy(model: nn.Module) -> nn.Module:
+    """
+    若模型支持结构重参数化，则切换到部署态；否则原样返回。
+    供 HIL / 推理脚本在加载后自动调用。
+    """
+    switch_fn = getattr(model, "switch_to_deploy", None)
+    if callable(switch_fn):
+        switch_fn()
+    return model
+
+
+# =============================================================================
 # 随机森林（手工特征 + sklearn RF），兼容 PyTorch 推理接口
 # =============================================================================
 
@@ -750,6 +1069,8 @@ def build_model(arch_or_type: str, num_classes: int) -> nn.Module:
       "resnet"     / "resnet1d"    / "resnet1d_bearing_v1"
       "shufflenet" / "shufflenet1d"/ "shufflenet1d_bearing_v1" / "shuffle"
       "conformer"  / "cnn_transformer" / "hybrid" / "conformer_bearing_v1"
+      "convnext"   / "convnext1d" / "convnext1d_bearing_v1" / "next"
+      "repvgg"     / "repvgg1d"   / "repvgg1d_bearing_v1" / "rep"
     """
     key = _ARCH_ALIASES.get(arch_or_type.lower(), arch_or_type)
     if key == ARCH_CNN:         return BearingCNN1D(num_classes=num_classes)
@@ -759,6 +1080,8 @@ def build_model(arch_or_type: str, num_classes: int) -> nn.Module:
     if key == ARCH_RESNET:      return BearingResNet1D(num_classes=num_classes)
     if key == ARCH_SHUFFLENET:  return BearingShuffleNet1D(num_classes=num_classes)
     if key == ARCH_CONFORMER:   return BearingConformer(num_classes=num_classes)
+    if key == ARCH_CONVNEXT:    return BearingConvNeXt1D(num_classes=num_classes)
+    if key == ARCH_REPVGG:      return BearingRepVGG1D(num_classes=num_classes)
     if key == ARCH_RF:
         raise ValueError(
             "RF 模型请直接使用 BearingRFWrapper 封装 sklearn RF，不通过 build_model 构建。"
@@ -817,6 +1140,18 @@ _HPARAMS: dict[str, dict] = {
         epochs=250, patience=20,
         warmup_epochs=10, grad_clip=1.0,  label_smoothing=0.10,
     ),
+    # ── ConvNeXt-1D：AdamW + LayerNorm 组合较稳，适度 warmup 防止前期震荡 ─────────
+    ARCH_CONVNEXT: dict(
+        lr=4e-4,    weight_decay=0.02,   batch_size=64,
+        epochs=250, patience=20,
+        warmup_epochs=5,  grad_clip=1.0,  label_smoothing=0.08,
+    ),
+    # ── RepVGG-1D：训练期多分支，收敛特性接近 ResNet；部署期可融合加速 ──────────
+    ARCH_REPVGG: dict(
+        lr=8e-4,    weight_decay=2e-4,   batch_size=64,
+        epochs=220, patience=18,
+        warmup_epochs=3,  grad_clip=1.0,  label_smoothing=0.05,
+    ),
 }
 
 
@@ -855,6 +1190,8 @@ def count_feature_layers(model: nn.Module) -> int:
       ResNet1D    → 残差块数（4）
       ShuffleNet  → 全部 ShuffleBlock 总数（stage1+2+3 = 2+3+4 = 9）
       Conformer   → CNN 层数 + Transformer Encoder 层数（2+4 = 6）
+      ConvNeXt1D  → 全部 ConvNeXt Block 总数（2+2+4+2 = 10）
+      RepVGG1D    → stem + 各 Stage block 总数（1+2+2+4+1 = 10）
     """
     if isinstance(model, BearingCNN1D):
         return sum(1 for m in model.features.children() if isinstance(m, nn.Conv1d))
@@ -873,5 +1210,57 @@ def count_feature_layers(model: nn.Module) -> int:
         # CNN 层数 + Transformer Encoder 层数
         n_cnn = sum(1 for m in model.cnn_stem.children() if isinstance(m, nn.Conv1d))
         return n_cnn + len(model.encoder.layers)
+    if isinstance(model, BearingConvNeXt1D):
+        return (
+            len(model.stage1) + len(model.stage2)
+            + len(model.stage3) + len(model.stage4)
+        )
+    if isinstance(model, BearingRepVGG1D):
+        return (
+            1 + len(model.stage1) + len(model.stage2)
+            + len(model.stage3) + len(model.stage4)
+        )
     # 回退：统计所有 Conv1d
     return sum(1 for m in model.modules() if isinstance(m, nn.Conv1d))
+
+
+def extract_classifier_input_features(model: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    """
+    提取分类头前的特征向量（用于 t-SNE / 可视化）。
+
+    返回形状统一为 (B, D)，其中 D 为各模型分类器输入维度。
+    """
+    with torch.no_grad():
+        if isinstance(model, BearingCNN1D):
+            return model.features(x).squeeze(-1)
+        if isinstance(model, BearingTransformer):
+            bsz, _, length = x.shape
+            xp = x.squeeze(1).reshape(bsz, length // model.patch_size, model.patch_size)
+            xp = model.patch_embed(xp) + model.pos_embed
+            return model.norm(model.encoder(xp).mean(dim=1))
+        if isinstance(model, BearingTCN):
+            return model.pool(model.network(x)).squeeze(-1)
+        if isinstance(model, BearingMobileNet1D):
+            xm = model.stem(x)
+            xm = model.blocks(xm)
+            return model.pool(xm).squeeze(-1)
+        if isinstance(model, BearingResNet1D):
+            xr = model.stem(x)
+            xr = model.blocks(xr)
+            return model.pool(xr).squeeze(-1)
+        if isinstance(model, BearingShuffleNet1D):
+            xs = model.stem(x)
+            xs = model.stage1(xs)
+            xs = model.stage2(xs)
+            xs = model.stage3(xs)
+            return model.pool(xs).squeeze(-1)
+        if isinstance(model, BearingConformer):
+            xc = model.cnn_stem(x).permute(0, 2, 1)
+            xc = model.encoder(xc + model.pos_embed)
+            return model.norm(xc.mean(dim=1))
+        if isinstance(model, BearingConvNeXt1D):
+            return model.forward_features(x)
+        if isinstance(model, BearingRepVGG1D):
+            return model.forward_features(x)
+
+    raise TypeError(f"暂不支持从 {type(model).__name__} 提取分类头输入特征。")
