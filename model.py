@@ -2,7 +2,7 @@
 """
 轴承故障诊断对比实验模型库（v3）。
 
-包含 9 种 PyTorch 模型：
+包含 10 种 PyTorch 模型：
   BearingCNN1D       — 4 层标准 1D-CNN（基线，旧 checkpoint 可直接加载）
   BearingTransformer — 4 层 Patch-ViT Transformer Encoder（全局注意力）
   BearingTCN         — 4 层扩张残差 TCN（dilation=4^i，感受野≈1021）
@@ -10,7 +10,8 @@
   BearingResNet1D    — 4 块残差网络（Skip Connection + BN，深层表达力强）
   BearingShuffleNet1D— 3 阶段 ShuffleNet V2（分组卷积+通道洗牌，HIL 低延迟）
   BearingConformer   — CNN×2 + Transformer×4 混合（局部降噪→全局周期识别）
-  BearingMSDCNN      — 多尺度并行 1D-CNN（MSDCNN，多分支感受野融合）
+  BearingMSCNN       — 多尺度局部卷积（并行 k=3/7/11，强调局部冲击）
+  BearingWDCNN       — 宽核深层卷积（首层大核 + 深层小核）
   BearingRepVGG1D    — RepVGG-1D（训练多分支 / 部署单分支 3×1 Conv）
   BearingRFWrapper   — 随机森林（sklearn），兼容 PyTorch 推理接口
 
@@ -36,7 +37,7 @@ import torch.nn.functional as F
 # 修改此处切换架构；train_bearing_cnn1d.py 会自动读取。
 # =============================================================================
 
-SelectModel: str = "cnn"
+SelectModel: str = "wdcnn"
 """全局架构选择，可选值：
   "cnn"         — BearingCNN1D（标准 1D-CNN，推荐基线）
   "transformer" — BearingTransformer（Patch-ViT Encoder）
@@ -45,7 +46,8 @@ SelectModel: str = "cnn"
   "resnet"      — BearingResNet1D（残差网络，深层表达力强）
   "shufflenet"  — BearingShuffleNet1D（ShuffleNet V2，HIL 低延迟优先）
   "conformer"   — BearingConformer（CNN+Transformer 混合，推荐高精度）
-  "msdcnn"      — BearingMSDCNN（多尺度并行卷积，兼顾局部冲击与周期特征）
+  "mscnn"       — BearingMSCNN（多尺度局部卷积，强调局部冲击）
+  "wdcnn"       — BearingWDCNN（宽核深层卷积，首层大核提取局部时频特征）
   "repvgg"      — BearingRepVGG1D（结构重参数化，HIL 推理可融合分支）
 """
 
@@ -62,7 +64,8 @@ ARCH_MOBILENET   = "mobilenet1d_bearing_v1"
 ARCH_RESNET      = "resnet1d_bearing_v1"
 ARCH_SHUFFLENET  = "shufflenet1d_bearing_v1"
 ARCH_CONFORMER   = "conformer_bearing_v1"
-ARCH_MSDCNN      = "msdcnn1d_bearing_v1"
+ARCH_MSCNN       = "mscnn1d_bearing_v1"
+ARCH_WDCNN       = "wdcnn1d_bearing_v1"
 ARCH_REPVGG      = "repvgg1d_bearing_v1"
 ARCH_RF          = "rf_bearing_v1"
 
@@ -96,11 +99,16 @@ _ARCH_ALIASES: dict[str, str] = {
     "cnn_transformer":      ARCH_CONFORMER,
     "hybrid":               ARCH_CONFORMER,
     ARCH_CONFORMER:         ARCH_CONFORMER,
-    # MSDCNN
-    "msdcnn":               ARCH_MSDCNN,
-    "multi_scale":          ARCH_MSDCNN,
-    "multiscale":           ARCH_MSDCNN,
-    ARCH_MSDCNN:            ARCH_MSDCNN,
+    # MSCNN
+    "mscnn":                ARCH_MSCNN,
+    "multi_scale_local":    ARCH_MSCNN,
+    "local_multiscale":     ARCH_MSCNN,
+    ARCH_MSCNN:             ARCH_MSCNN,
+    # WDCNN
+    "wdcnn":                ARCH_WDCNN,
+    "wide_deep":            ARCH_WDCNN,
+    "wide_kernel":          ARCH_WDCNN,
+    ARCH_WDCNN:             ARCH_WDCNN,
     # RepVGG
     "repvgg":               ARCH_REPVGG,
     "repvgg1d":             ARCH_REPVGG,
@@ -683,17 +691,17 @@ class BearingConformer(nn.Module):
 
 
 # =============================================================================
-# 模型 8：BearingMSDCNN — Multi-Scale Deep CNN（多尺度并行卷积）
+# 模型 8：BearingMSCNN — Multi-Scale Local CNN（多尺度局部卷积）
 # =============================================================================
 
-class _MSDCNNBranch1D(nn.Module):
-    """单个多尺度分支：不同卷积核感受不同故障频带与周期结构。"""
+class _LocalConvBranch1D(nn.Module):
+    """局部分支：仅用普通卷积（无 dilation）提取不同宽度脉冲。"""
 
-    def __init__(self, in_ch: int, out_ch: int, kernel_size: int, stride: int = 1):
+    def __init__(self, in_ch: int, out_ch: int, kernel_size: int):
         super().__init__()
         pad = kernel_size // 2
         self.branch = nn.Sequential(
-            nn.Conv1d(in_ch, out_ch, kernel_size, stride=stride, padding=pad, bias=False),
+            nn.Conv1d(in_ch, out_ch, kernel_size=kernel_size, padding=pad, bias=False),
             nn.BatchNorm1d(out_ch),
             nn.GELU(),
             nn.Conv1d(out_ch, out_ch, kernel_size=3, padding=1, bias=False),
@@ -705,83 +713,135 @@ class _MSDCNNBranch1D(nn.Module):
         return self.branch(x)
 
 
-class _MSDCNNBlock(nn.Module):
+class BearingMSCNN(nn.Module):
     """
-    MSDCNN 多尺度块：
-      并行 4 个卷积分支（k = 3 / 7 / 11 / 15）
-      → 通道拼接 → 1×1 融合 → 残差连接
+    多尺度局部卷积网络（MSCNN），强调轴承故障中的局部冲击特征。
 
-    小核更敏感于局部冲击脉冲，大核更利于覆盖故障周期与谐波调制。
-    """
-
-    _KERNELS = (3, 7, 11, 15)
-
-    def __init__(self, in_ch: int, out_ch: int, stride: int = 1):
-        super().__init__()
-        n_branches = len(self._KERNELS)
-        branch_ch = out_ch // n_branches
-        if branch_ch * n_branches != out_ch:
-            raise ValueError(f"out_ch={out_ch} 需能被分支数 {n_branches} 整除。")
-
-        self.branches = nn.ModuleList([
-            _MSDCNNBranch1D(in_ch, branch_ch, kernel_size=k, stride=stride)
-            for k in self._KERNELS
-        ])
-        self.fuse = nn.Sequential(
-            nn.Conv1d(out_ch, out_ch, kernel_size=1, bias=False),
-            nn.BatchNorm1d(out_ch),
-        )
-        if stride != 1 or in_ch != out_ch:
-            self.skip = nn.Sequential(
-                nn.Conv1d(in_ch, out_ch, kernel_size=1, stride=stride, bias=False),
-                nn.BatchNorm1d(out_ch),
-            )
-        else:
-            self.skip = nn.Identity()
-        self.act = nn.GELU()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        merged = torch.cat([branch(x) for branch in self.branches], dim=1)
-        return self.act(self.fuse(merged) + self.skip(x))
-
-
-class BearingMSDCNN(nn.Module):
-    """
-    MSDCNN（Multi-Scale Deep CNN），专为 1024 点轴承振动窗设计。
-
-    关键设计说明：
-      1. Stem 先用大核卷积对原始时域信号做初步降噪，并快速压缩长度。
-      2. 每个多尺度块内部包含 4 个并行卷积分支（k=3/7/11/15），
-         同时捕捉局部冲击、包络变化与更长周期的故障模式。
-      3. 各分支输出在通道维拼接后经 1×1 卷积融合，再与残差支路相加，
-         保持多分支并行计算能力，同时稳定深层训练。
-
-    结构：
-      Stem   — Conv(k=17, s=4) → BN → GELU             [1024 → 256, ch:1→32]
-      Block1 — MSDCNNBlock(32  → 64,  s=2)            [ 256 → 128]
-      Block2 — MSDCNNBlock(64  → 128, s=2)            [ 128 →  64]
-      Block3 — MSDCNNBlock(128 → 256, s=2)            [  64 →  32]
-      Block4 — MSDCNNBlock(256 → 256, s=1)            [  32 →  32]
-      GAP + Dropout + Linear(256 → num_classes)
+    并行三分支（均无 dilation）：
+      分支 1: k=3  → 捕获极窄冲击
+      分支 2: k=7  → 捕获中等冲击
+      分支 3: k=11 → 捕获较宽脉冲
 
     输入:  (B, 1, L=1024)
     输出:  (B, num_classes) logits
     """
+
+    _KERNELS = (3, 7, 11)
 
     def __init__(self, num_classes: int = 10):
         super().__init__()
         self.num_classes = num_classes
 
         self.stem = nn.Sequential(
-            nn.Conv1d(1, 32, kernel_size=17, stride=4, padding=8, bias=False),
+            nn.Conv1d(1, 48, kernel_size=9, stride=2, padding=4, bias=False),
+            nn.BatchNorm1d(48),
+            nn.GELU(),
+        )
+        self.branches = nn.ModuleList([
+            _LocalConvBranch1D(48, 32, kernel_size=k) for k in self._KERNELS
+        ])
+        self.fuse = nn.Sequential(
+            nn.Conv1d(96, 128, kernel_size=1, bias=False),
+            nn.BatchNorm1d(128),
+            nn.GELU(),
+        )
+        self.post = nn.Sequential(
+            nn.Conv1d(128, 192, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm1d(192),
+            nn.GELU(),
+            nn.Conv1d(192, 256, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm1d(256),
+            nn.GELU(),
+        )
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.drop = nn.Dropout(0.10)
+        self.classifier = nn.Linear(256, num_classes)
+
+    def forward_features(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.stem(x)
+        x = torch.cat([branch(x) for branch in self.branches], dim=1)
+        x = self.fuse(x)
+        x = self.post(x)
+        return self.pool(x).squeeze(-1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.classifier(self.drop(self.forward_features(x)))
+
+
+# =============================================================================
+# 模型 9：BearingWDCNN — Wide-First Deep CNN（宽核深层卷积）
+# =============================================================================
+
+class _CBAM1D(nn.Module):
+    """1D 版 CBAM（通道 + 空间注意力），增强局部关键故障点响应。"""
+
+    def __init__(self, channels: int, reduction: int = 16, spatial_kernel: int = 7):
+        super().__init__()
+        hidden = max(4, channels // reduction)
+        self.mlp = nn.Sequential(
+            nn.Conv1d(channels, hidden, kernel_size=1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(hidden, channels, kernel_size=1, bias=False),
+        )
+        self.spatial = nn.Conv1d(
+            2, 1, kernel_size=spatial_kernel, padding=spatial_kernel // 2, bias=False
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        ch_avg = self.mlp(F.adaptive_avg_pool1d(x, 1))
+        ch_max = self.mlp(F.adaptive_max_pool1d(x, 1))
+        x = x * torch.sigmoid(ch_avg + ch_max)
+
+        sp_avg = torch.mean(x, dim=1, keepdim=True)
+        sp_max, _ = torch.max(x, dim=1, keepdim=True)
+        sp = torch.cat([sp_avg, sp_max], dim=1)
+        return x * torch.sigmoid(self.spatial(sp))
+
+
+class _WDCNNConvBlock(nn.Module):
+    """WDCNN 小核卷积块：Conv3 + BN + GELU，按需叠加 CBAM。"""
+
+    def __init__(self, in_ch: int, out_ch: int, use_cbam: bool = False):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv1d(in_ch, out_ch, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm1d(out_ch),
+            nn.GELU(),
+        )
+        self.cbam = _CBAM1D(out_ch) if use_cbam else nn.Identity()
+        self.pool = nn.MaxPool1d(kernel_size=2, stride=2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.conv(x)
+        x = self.cbam(x)
+        return self.pool(x)
+
+
+class BearingWDCNN(nn.Module):
+    """
+    宽核深层卷积网络（WDCNN）。
+
+    结构：
+      Layer0: Conv(k=64, s=16) 大核初筛局部时频形态
+      Layer1-4: 4 层小核 Conv(k=3) 深层提取高级故障特征
+      可选：最后两层使用 CBAM（默认开启）
+    """
+
+    def __init__(self, num_classes: int = 10, use_cbam: bool = True):
+        super().__init__()
+        self.num_classes = num_classes
+        self.use_cbam = use_cbam
+
+        self.stem = nn.Sequential(
+            nn.Conv1d(1, 32, kernel_size=64, stride=16, padding=24, bias=False),
             nn.BatchNorm1d(32),
             nn.GELU(),
         )
         self.blocks = nn.Sequential(
-            _MSDCNNBlock(32, 64, stride=2),
-            _MSDCNNBlock(64, 128, stride=2),
-            _MSDCNNBlock(128, 256, stride=2),
-            _MSDCNNBlock(256, 256, stride=1),
+            _WDCNNConvBlock(32, 64, use_cbam=False),
+            _WDCNNConvBlock(64, 128, use_cbam=False),
+            _WDCNNConvBlock(128, 192, use_cbam=use_cbam),
+            _WDCNNConvBlock(192, 256, use_cbam=use_cbam),
         )
         self.pool = nn.AdaptiveAvgPool1d(1)
         self.drop = nn.Dropout(0.10)
@@ -797,7 +857,7 @@ class BearingMSDCNN(nn.Module):
 
 
 # =============================================================================
-# 模型 9：BearingRepVGG1D — 结构重参数化 1D 卷积网络
+# 模型 10：BearingRepVGG1D — 结构重参数化 1D 卷积网络
 # =============================================================================
 
 class _RepVGGBlock1D(nn.Module):
@@ -1116,6 +1176,12 @@ def extract_classifier_input_features(
         t = t + model.pos_embed
         t = model.encoder(t)
         return model.norm(t.mean(dim=1))
+    if isinstance(model, BearingMSCNN):
+        return model.forward_features(x)
+    if isinstance(model, BearingWDCNN):
+        return model.forward_features(x)
+    if isinstance(model, BearingRepVGG1D):
+        return model.forward_features(x)
 
     # receive_udp_hil 占位模型：仅 nn.Linear(1024, C)，无主干
     fc = getattr(model, "fc", None)
@@ -1155,8 +1221,9 @@ def build_model(arch_or_type: str, num_classes: int) -> nn.Module:
       "resnet"     / "resnet1d"    / "resnet1d_bearing_v1"
       "shufflenet" / "shufflenet1d"/ "shufflenet1d_bearing_v1" / "shuffle"
       "conformer"  / "cnn_transformer" / "hybrid" / "conformer_bearing_v1"
-      "msdcnn"     / "multi_scale" / "multiscale" / "msdcnn1d_bearing_v1"
-      "repvgg"     / "repvgg1d"   / "repvgg1d_bearing_v1" / "rep"
+      "mscnn"      / "multi_scale_local" / "local_multiscale" / "mscnn1d_bearing_v1"
+      "wdcnn"      / "wide_deep" / "wide_kernel" / "wdcnn1d_bearing_v1"
+      "repvgg"     / "repvgg1d" / "repvgg1d_bearing_v1" / "rep"
     """
     key = _ARCH_ALIASES.get(arch_or_type.lower(), arch_or_type)
     if key == ARCH_CNN:         return BearingCNN1D(num_classes=num_classes)
@@ -1166,7 +1233,8 @@ def build_model(arch_or_type: str, num_classes: int) -> nn.Module:
     if key == ARCH_RESNET:      return BearingResNet1D(num_classes=num_classes)
     if key == ARCH_SHUFFLENET:  return BearingShuffleNet1D(num_classes=num_classes)
     if key == ARCH_CONFORMER:   return BearingConformer(num_classes=num_classes)
-    if key == ARCH_MSDCNN:      return BearingMSDCNN(num_classes=num_classes)
+    if key == ARCH_MSCNN:       return BearingMSCNN(num_classes=num_classes)
+    if key == ARCH_WDCNN:       return BearingWDCNN(num_classes=num_classes, use_cbam=True)
     if key == ARCH_REPVGG:      return BearingRepVGG1D(num_classes=num_classes)
     if key == ARCH_RF:
         raise ValueError(
@@ -1226,11 +1294,17 @@ _HPARAMS: dict[str, dict] = {
         epochs=250, patience=20,
         warmup_epochs=10, grad_clip=1.0,  label_smoothing=0.10,
     ),
-    # ── MSDCNN：多分支并行卷积，学习率参考 TCN，略增 weight decay 抑制过拟合 ─────
-    ARCH_MSDCNN: dict(
-        lr=6e-4,    weight_decay=1.5e-3, batch_size=64,
-        epochs=250, patience=20,
-        warmup_epochs=5,  grad_clip=1.0,  label_smoothing=0.08,
+    # ── MSCNN：并行局部卷积（k=3/7/11），建议较快初始学习率 ─────────────────────
+    ARCH_MSCNN: dict(
+        lr=1e-3,    weight_decay=8e-4,   batch_size=64,
+        epochs=220, patience=18,
+        warmup_epochs=3,  grad_clip=1.0,  label_smoothing=0.05,
+    ),
+    # ── WDCNN：首层宽核 + 深层小核，默认开启后两层 CBAM ─────────────────────────
+    ARCH_WDCNN: dict(
+        lr=1e-3,    weight_decay=1e-3,   batch_size=64,
+        epochs=220, patience=18,
+        warmup_epochs=3,  grad_clip=1.0,  label_smoothing=0.05,
     ),
     # ── RepVGG-1D：训练期多分支，收敛特性接近 ResNet；部署期可融合加速 ──────────
     ARCH_REPVGG: dict(
@@ -1276,7 +1350,8 @@ def count_feature_layers(model: nn.Module) -> int:
       ResNet1D    → 残差块数（4）
       ShuffleNet  → 全部 ShuffleBlock 总数（stage1+2+3 = 2+3+4 = 9）
       Conformer   → CNN 层数 + Transformer Encoder 层数（2+4 = 6）
-      MSDCNN      → 多尺度卷积块数（4）
+      MSCNN       → stem + 并行分支卷积层 + 后级卷积层（8）
+      WDCNN       → 宽核首层 + 4 个小核块（5）
       RepVGG1D    → stem + 各 Stage block 总数（1+2+2+4+1 = 10）
     """
     if isinstance(model, BearingCNN1D):
@@ -1296,8 +1371,11 @@ def count_feature_layers(model: nn.Module) -> int:
         # CNN 层数 + Transformer Encoder 层数
         n_cnn = sum(1 for m in model.cnn_stem.children() if isinstance(m, nn.Conv1d))
         return n_cnn + len(model.encoder.layers)
-    if isinstance(model, BearingMSDCNN):
-        return len(model.blocks)
+    if isinstance(model, BearingMSCNN):
+        # stem(1) + 三分支各2层(6) + post(2) 中主要卷积层按局部提取深度统计为 8
+        return 8
+    if isinstance(model, BearingWDCNN):
+        return 1 + len(model.blocks)
     if isinstance(model, BearingRepVGG1D):
         return (
             1 + len(model.stage1) + len(model.stage2)
@@ -1307,43 +1385,3 @@ def count_feature_layers(model: nn.Module) -> int:
     return sum(1 for m in model.modules() if isinstance(m, nn.Conv1d))
 
 
-def extract_classifier_input_features(model: nn.Module, x: torch.Tensor) -> torch.Tensor:
-    """
-    提取分类头前的特征向量（用于 t-SNE / 可视化）。
-
-    返回形状统一为 (B, D)，其中 D 为各模型分类器输入维度。
-    """
-    with torch.no_grad():
-        if isinstance(model, BearingCNN1D):
-            return model.features(x).squeeze(-1)
-        if isinstance(model, BearingTransformer):
-            bsz, _, length = x.shape
-            xp = x.squeeze(1).reshape(bsz, length // model.patch_size, model.patch_size)
-            xp = model.patch_embed(xp) + model.pos_embed
-            return model.norm(model.encoder(xp).mean(dim=1))
-        if isinstance(model, BearingTCN):
-            return model.pool(model.network(x)).squeeze(-1)
-        if isinstance(model, BearingMobileNet1D):
-            xm = model.stem(x)
-            xm = model.blocks(xm)
-            return model.pool(xm).squeeze(-1)
-        if isinstance(model, BearingResNet1D):
-            xr = model.stem(x)
-            xr = model.blocks(xr)
-            return model.pool(xr).squeeze(-1)
-        if isinstance(model, BearingShuffleNet1D):
-            xs = model.stem(x)
-            xs = model.stage1(xs)
-            xs = model.stage2(xs)
-            xs = model.stage3(xs)
-            return model.pool(xs).squeeze(-1)
-        if isinstance(model, BearingConformer):
-            xc = model.cnn_stem(x).permute(0, 2, 1)
-            xc = model.encoder(xc + model.pos_embed)
-            return model.norm(xc.mean(dim=1))
-        if isinstance(model, BearingMSDCNN):
-            return model.forward_features(x)
-        if isinstance(model, BearingRepVGG1D):
-            return model.forward_features(x)
-
-    raise TypeError(f"暂不支持从 {type(model).__name__} 提取分类头输入特征。")

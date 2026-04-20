@@ -64,9 +64,10 @@ QUEUE_MAXSIZE = 24
 #   "resnet"      — BearingResNet1D     残差网络（深层表达力强）
 #   "shufflenet"  — BearingShuffleNet1D ShuffleNet V2（HIL 低延迟优先）
 #   "conformer"   — BearingConformer    CNN+Transformer 混合（推荐高精度）
-#   "msdcnn"      — BearingMSDCNN       多尺度并行卷积（多分支周期特征建模）
+#   "mscnn"       — BearingMSCNN        多尺度局部卷积（并行 k=3/7/11）
+#   "wdcnn"       — BearingWDCNN        宽核深层卷积（首层大核 + 后级小核）
 #   "repvgg"      — BearingRepVGG1D     结构重参数化 CNN（HIL 加载后自动融合）
-SelectModel = "cnn"
+SelectModel = "tcn"
 
 # ── ★ 权重选择 ★ ───────────────────────────────────────────────────────────────
 # 对应 train_bearing_cnn1d.py 双模型训练生成的两个文件：
@@ -312,7 +313,7 @@ def load_diagnostic_model(model_path: str, num_classes: int):
     在**当前进程**内加载模型（子进程须各自调用，勿跨进程传递 nn.Module）。
 
     支持从 model.py 导出的全部架构（CNN / Transformer / TCN / MobileNet /
-    ResNet / ShuffleNet / Conformer / MSDCNN / RepVGG / RF），
+    ResNet / ShuffleNet / Conformer / MSCNN / WDCNN / RepVGG / RF），
     也兼容仅用 bearing_models.py 保存的旧版 CNN checkpoint。
     """
     try:
@@ -323,7 +324,7 @@ def load_diagnostic_model(model_path: str, num_classes: int):
         return None
 
     # 尝试导入新架构模块（model.py v3：支持 CNN/Transformer/TCN/MobileNet/ResNet/
-    # ShuffleNet/Conformer/MSDCNN/RepVGG）
+    # ShuffleNet/Conformer/MSCNN/WDCNN/RepVGG）
     try:
         from model import (
             build_model,
@@ -387,7 +388,7 @@ def load_diagnostic_model(model_path: str, num_classes: int):
             return wrapper
 
         # ── PyTorch 神经网络（CNN / Transformer / TCN / MobileNet / ResNet /
-        #    ShuffleNet / Conformer / MSDCNN / RepVGG）──
+        #    ShuffleNet / Conformer / MSCNN / WDCNN / RepVGG）──
         if "state_dict" in obj:
             try:
                 if _model_ok and arch is not None and arch in _ARCH_ALIASES:
